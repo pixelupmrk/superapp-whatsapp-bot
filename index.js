@@ -14,20 +14,21 @@ console.log('Variáveis lidas com sucesso.');
 
 // Inicializa Firebase
 try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: `https://${firebaseConfig.projectId}.firebaseio.com`
-    });
-    console.log('✅ Conectado ao Firebase!');
-} catch (error) {
-    if (!/already exists/i.test(error.message)) {
-        console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
+    if (admin.apps.length === 0) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            databaseURL: `https://${firebaseConfig.projectId}.firebaseio.com`
+        });
+        console.log('✅ Conectado ao Firebase!');
     }
+} catch (error) {
+    console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
 }
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-pro" });
+// A MUDANÇA ESTÁ AQUI! Usando o modelo mais compatível 'gemini-1.0-pro'
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
 console.log('✅ Conectado à API do Gemini!');
 
 // === VARIÁVEIS DE ESTADO ===
@@ -125,14 +126,12 @@ client.on('message', async message => {
     }
     
     try {
-        // CORREÇÃO APLICADA AQUI: A mensagem do usuário só é adicionada ao histórico DEPOIS de ser enviada.
         const chat = geminiModel.startChat({ history: conversas[contato] });
         const result = await chat.sendMessage(textoRecebido);
         const respostaIA = result.response.text();
 
         console.log(`Resposta da IA: "${respostaIA}"`);
 
-        // Adiciona a troca de mensagens ao histórico para a próxima interação
         conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
         conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
 
@@ -147,11 +146,10 @@ client.on('message', async message => {
                 const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
                 await client.sendMessage(contato, msgFinal);
 
-                delete conversas[contato]; // Limpa a conversa da memória
+                delete conversas[contato];
                 return;
             }
         } catch (e) {
-            // Se não for um JSON, apenas envia a resposta da IA para o usuário
             await client.sendMessage(contato, respostaIA);
         }
 
@@ -163,7 +161,6 @@ client.on('message', async message => {
 
 async function adicionarLeadNoCRM(dadosDoLead) {
     try {
-        // IMPORTANTE: Este UID é de exemplo, verifique se é o UID correto para salvar os leads
         const userId = "bSqhMhT6o6Zg0u3bCMT2w5i7c8C2";
         if (!userId) throw new Error("UID do usuário não definido!");
         
