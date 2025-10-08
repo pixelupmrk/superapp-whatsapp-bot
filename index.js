@@ -27,8 +27,8 @@ try {
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-// A MUDANÇA ESTÁ AQUI! Usando o modelo mais compatível 'gemini-1.0-pro'
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+// Alterado conforme sua solicitação para teste
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 console.log('✅ Conectado à API do Gemini!');
 
 // === VARIÁVEIS DE ESTADO ===
