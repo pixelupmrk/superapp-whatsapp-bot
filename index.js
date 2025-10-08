@@ -1,5 +1,6 @@
 // === DEPENDÊNCIAS ===
-const qrcode = require('qrcode-terminal');
+const http = require('http');
+const qrcode = require('qrcode');
 const { Client } = require('whatsapp-web.js');
 const admin = require('firebase-admin');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -22,40 +23,67 @@ try {
     console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
 }
 
-
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 console.log('✅ Conectado à API do Gemini!');
 
+// === VARIÁVEIS DE ESTADO ===
+let qrCodeDataUrl = null;
+let botStatus = "Iniciando...";
+
+// === SERVIDOR WEB PARA EXIBIR O QR CODE ===
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    if (qrCodeDataUrl) {
+        res.end(`
+            <div style="font-family: sans-serif; text-align: center; padding: 40px;">
+                <h1>Escaneie para Conectar</h1>
+                <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
+                <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px;">
+                <p style="margin-top: 20px;">Após escanear, aguarde a mensagem de confirmação nesta página.</p>
+            </div>
+        `);
+    } else {
+        res.end(`
+            <div style="font-family: sans-serif; text-align: center; padding: 40px;">
+                <h1>SuperApp WhatsApp Bot</h1>
+                <p><strong>Status:</strong> ${botStatus}</p>
+                <p>Aguarde, gerando QR Code... Se demorar muito, verifique os logs na Render.</p>
+            </div>
+        `);
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`✅ Servidor web rodando na porta ${PORT}. Acesse a URL do seu serviço para ver o QR Code.`);
+});
+
+
 // === BOT DO WHATSAPP ===
 const client = new Client();
-let qrCodeGerado = false; // Flag para controlar o QR Code
 
-client.on('qr', qr => {
-    if (qrCodeGerado) return; // Se já gerou, não faz nada
-    qrCodeGerado = true; // Marca que o QR Code foi gerado
-
-    console.log("--------------------------------------------------");
-    console.log("LEIA O QR CODE ABAIXO COM SEU CELULAR:");
-    qrcode.generate(qr, { small: true });
-    console.log("--------------------------------------------------");
+client.on('qr', async (qr) => {
+    console.log("QR Code recebido, gerando imagem...");
+    botStatus = "Aguardando escaneamento do QR Code.";
+    qrCodeDataUrl = await qrcode.toDataURL(qr);
 });
 
 client.on('ready', () => {
     console.log('✅ Cliente WhatsApp conectado e pronto para trabalhar!');
-    qrCodeGerado = false; // Reseta a flag para o caso de precisar reconectar
+    botStatus = "Conectado com sucesso! O bot já está funcionando.";
+    qrCodeDataUrl = null; // Limpa o QR Code pois não é mais necessário
 });
 
 client.on('disconnected', (reason) => {
     console.log('❌ Cliente foi desconectado!', reason);
-    qrCodeGerado = false; // Permite gerar um novo QR Code na próxima tentativa
+    botStatus = `Desconectado: ${reason}. Reiniciando...`;
     // A Render irá reiniciar o processo automaticamente se ele falhar.
 });
 
-// Armazena o histórico das conversas em memória
+// ... (O restante do código do bot continua exatamente igual) ...
 const conversas = {};
-
 const PROMPT_ASSISTENTE = `
 Você é um assistente virtual para a PixelUp. Sua função é fazer o pré-atendimento de novos clientes via WhatsApp.
 Seu objetivo é extrair 4 informações: NOME, ASSUNTO, ORÇAMENTO e PRAZO.
@@ -77,7 +105,6 @@ Siga estas regras estritamente:
 client.on('message', async message => {
     const contato = message.from;
     const textoRecebido = message.body;
-
     console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
     if (message.isGroup) return;
 
@@ -123,17 +150,11 @@ client.on('message', async message => {
 
 async function adicionarLeadNoCRM(dadosDoLead) {
     try {
-        const userId = "bSqhMhT6o6Zg0u3bCMT2w5i7c8C2"; // <--- LEMBRE-SE DE VERIFICAR SE ESTE UID ESTÁ CORRETO
+        const userId = "bSqhMhT6o6Zg0u3bCMT2w5i7c8C2";
         if (!userId) throw new Error("UID do usuário não definido!");
-
         const userDocRef = db.collection('userData').doc(userId);
         const userDoc = await userDocRef.get();
-
-        let leadsAtuais = [];
-        if (userDoc.exists) {
-            leadsAtuais = userDoc.data().leads || [];
-        }
-        
+        let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
         const novoLead = {
             id: leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0,
             nome: dadosDoLead.nome || "Não informado",
@@ -144,7 +165,6 @@ async function adicionarLeadNoCRM(dadosDoLead) {
             notas: `[Lead criado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`,
             email: ""
         };
-
         leadsAtuais.push(novoLead);
         await userDocRef.set({ leads: leadsAtuais }, { merge: true });
         console.log(`✅ Lead "${novoLead.nome}" salvo com sucesso no CRM!`);
