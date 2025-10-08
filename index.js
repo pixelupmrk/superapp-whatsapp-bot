@@ -25,7 +25,8 @@ try {
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+// A MUDANÇA ESTÁ AQUI! Usando o modelo 'gemini-pro'
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-pro" });
 console.log('✅ Conectado à API do Gemini!');
 
 // === VARIÁVEIS DE ESTADO ===
@@ -62,7 +63,15 @@ server.listen(PORT, () => {
 
 
 // === BOT DO WHATSAPP ===
-const client = new Client();
+const client = new Client({
+    puppeteer: {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox'
+        ]
+    }
+});
 
 client.on('qr', async (qr) => {
     console.log("QR Code recebido, gerando imagem...");
@@ -73,16 +82,15 @@ client.on('qr', async (qr) => {
 client.on('ready', () => {
     console.log('✅ Cliente WhatsApp conectado e pronto para trabalhar!');
     botStatus = "Conectado com sucesso! O bot já está funcionando.";
-    qrCodeDataUrl = null; // Limpa o QR Code pois não é mais necessário
+    qrCodeDataUrl = null; 
 });
 
 client.on('disconnected', (reason) => {
     console.log('❌ Cliente foi desconectado!', reason);
     botStatus = `Desconectado: ${reason}. Reiniciando...`;
-    // A Render irá reiniciar o processo automaticamente se ele falhar.
 });
 
-// ... (O restante do código do bot continua exatamente igual) ...
+// ... O restante do código do bot continua exatamente igual ...
 const conversas = {};
 const PROMPT_ASSISTENTE = `
 Você é um assistente virtual para a PixelUp. Sua função é fazer o pré-atendimento de novos clientes via WhatsApp.
