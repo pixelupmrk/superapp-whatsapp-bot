@@ -20,12 +20,13 @@ try {
     });
     console.log('✅ Conectado ao Firebase!');
 } catch (error) {
-    console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
+    if (!/already exists/i.test(error.message)) {
+        console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
+    }
 }
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-// A MUDANÇA ESTÁ AQUI! Usando o modelo 'gemini-pro'
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-pro" });
 console.log('✅ Conectado à API do Gemini!');
 
@@ -42,7 +43,7 @@ const server = http.createServer((req, res) => {
                 <h1>Escaneie para Conectar</h1>
                 <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
                 <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px;">
-                <p style="margin-top: 20px;">Após escanear, aguarde a mensagem de confirmação nesta página.</p>
+                <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
             </div>
         `);
     } else {
@@ -50,7 +51,7 @@ const server = http.createServer((req, res) => {
             <div style="font-family: sans-serif; text-align: center; padding: 40px;">
                 <h1>SuperApp WhatsApp Bot</h1>
                 <p><strong>Status:</strong> ${botStatus}</p>
-                <p>Aguarde, gerando QR Code... Se demorar muito, verifique os logs na Render.</p>
+                 <p>Se o QR Code não aparecer em 30 segundos, atualize a página.</p>
             </div>
         `);
     }
@@ -75,7 +76,7 @@ const client = new Client({
 
 client.on('qr', async (qr) => {
     console.log("QR Code recebido, gerando imagem...");
-    botStatus = "Aguardando escaneamento do QR Code.";
+    botStatus = "Aguardando escaneamento do QR Code. Acesse a URL do seu bot para escanear.";
     qrCodeDataUrl = await qrcode.toDataURL(qr);
 });
 
@@ -88,9 +89,9 @@ client.on('ready', () => {
 client.on('disconnected', (reason) => {
     console.log('❌ Cliente foi desconectado!', reason);
     botStatus = `Desconectado: ${reason}. Reiniciando...`;
+    client.initialize();
 });
 
-// ... O restante do código do bot continua exatamente igual ...
 const conversas = {};
 const PROMPT_ASSISTENTE = `
 Você é um assistente virtual para a PixelUp. Sua função é fazer o pré-atendimento de novos clientes via WhatsApp.
@@ -123,13 +124,17 @@ client.on('message', async message => {
         ];
     }
     
-    conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
-
     try {
+        // CORREÇÃO APLICADA AQUI: A mensagem do usuário só é adicionada ao histórico DEPOIS de ser enviada.
         const chat = geminiModel.startChat({ history: conversas[contato] });
         const result = await chat.sendMessage(textoRecebido);
         const respostaIA = result.response.text();
+
         console.log(`Resposta da IA: "${respostaIA}"`);
+
+        // Adiciona a troca de mensagens ao histórico para a próxima interação
+        conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
+        conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
 
         try {
             const dadosExtraidos = JSON.parse(respostaIA);
@@ -142,12 +147,12 @@ client.on('message', async message => {
                 const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
                 await client.sendMessage(contato, msgFinal);
 
-                delete conversas[contato];
+                delete conversas[contato]; // Limpa a conversa da memória
                 return;
             }
         } catch (e) {
+            // Se não for um JSON, apenas envia a resposta da IA para o usuário
             await client.sendMessage(contato, respostaIA);
-            conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
         }
 
     } catch (error) {
@@ -158,11 +163,14 @@ client.on('message', async message => {
 
 async function adicionarLeadNoCRM(dadosDoLead) {
     try {
+        // IMPORTANTE: Este UID é de exemplo, verifique se é o UID correto para salvar os leads
         const userId = "bSqhMhT6o6Zg0u3bCMT2w5i7c8C2";
         if (!userId) throw new Error("UID do usuário não definido!");
+        
         const userDocRef = db.collection('userData').doc(userId);
         const userDoc = await userDocRef.get();
         let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
+        
         const novoLead = {
             id: leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0,
             nome: dadosDoLead.nome || "Não informado",
@@ -173,6 +181,7 @@ async function adicionarLeadNoCRM(dadosDoLead) {
             notas: `[Lead criado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`,
             email: ""
         };
+
         leadsAtuais.push(novoLead);
         await userDocRef.set({ leads: leadsAtuais }, { merge: true });
         console.log(`✅ Lead "${novoLead.nome}" salvo com sucesso no CRM!`);
