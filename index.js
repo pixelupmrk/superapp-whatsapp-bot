@@ -27,7 +27,7 @@ try {
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-// Alterado conforme sua solicitação para teste
+// Alterado para 'gemini-2.5-flash' conforme solicitado
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 console.log('✅ Conectado à API do Gemini!');
 
@@ -125,36 +125,43 @@ client.on('message', async message => {
         ];
     }
     
-    try {
-        const chat = geminiModel.startChat({ history: conversas[contato] });
-        const result = await chat.sendMessage(textoRecebido);
-        const respostaIA = result.response.text();
+    // Adiciona a nova mensagem do usuário ao histórico para enviar para a IA
+    conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
 
+    try {
+        const result = await geminiModel.generateContent({ contents: conversas[contato] });
+        const respostaIA = result.response.text();
         console.log(`Resposta da IA: "${respostaIA}"`);
 
-        conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
+        // Adiciona a resposta da IA ao histórico para a próxima rodada
         conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
 
+        let dadosExtraidos;
         try {
-            const dadosExtraidos = JSON.parse(respostaIA);
-            if (dadosExtraidos.finalizado === true) {
-                console.log("Conversa finalizada. Tentando salvar no CRM...");
-                dadosExtraidos.whatsapp = contato.replace('@c.us', '');
-                
-                await adicionarLeadNoCRM(dadosExtraidos);
-                
-                const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
-                await client.sendMessage(contato, msgFinal);
-
-                delete conversas[contato];
-                return;
-            }
+            dadosExtraidos = JSON.parse(respostaIA);
         } catch (e) {
+            // Se não for um JSON, é uma continuação da conversa. Apenas envia a resposta.
             await client.sendMessage(contato, respostaIA);
+            return;
+        }
+
+        // Se for um JSON e estiver finalizado, executa as ações finais.
+        if (dadosExtraidos && dadosExtraidos.finalizado === true) {
+            console.log("Conversa finalizada. Tentando salvar no CRM...");
+            dadosExtraidos.whatsapp = contato.replace('@c.us', '');
+            
+            await adicionarLeadNoCRM(dadosExtraidos);
+            
+            const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
+            await client.sendMessage(contato, msgFinal);
+
+            delete conversas[contato]; // Limpa a conversa da memória
         }
 
     } catch (error) {
         console.error("❌ Erro na comunicação com o Gemini:", error);
+        // Remove a última mensagem do usuário do histórico, pois a IA falhou em responder
+        conversas[contato].pop();
         await client.sendMessage(contato, "Desculpe, estou com um problema técnico no momento. Tente novamente mais tarde.");
     }
 });
