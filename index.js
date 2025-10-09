@@ -39,10 +39,22 @@ let qrCodeDataUrl = null;
 let botStatus = "Iniciando...";
 let clientReady = false;
 
-// === SERVIDOR WEB PARA EXIBIR O QR CODE ===
+// === SERVIDOR WEB PARA EXIBIR O QR CODE E RECEBER COMANDOS ===
 const server = http.createServer(async (req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    // Permite CORS para que o seu SuperApp possa se comunicar com o bot
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+
+    // Rota para exibir o QR Code ou Status
     if (req.url === '/' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         if (qrCodeDataUrl) {
             res.end(`
                 <body style="background-color: #1a1a2e;">
@@ -67,6 +79,41 @@ const server = http.createServer(async (req, res) => {
         }
         return;
     }
+
+    // Rota para o Super App enviar mensagens
+    if (req.url === '/send-message' && req.method === 'POST') {
+        if (!clientReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'Cliente WhatsApp não está pronto.' }));
+            return;
+        }
+        
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
+            try {
+                const { number, message, leadId } = JSON.parse(body);
+                if (!number || !message || !leadId) {
+                    throw new Error('Número, mensagem e leadId são necessários.');
+                }
+                
+                const chatId = `${number}@c.us`;
+                await client.sendMessage(chatId, message);
+                await salvarMensagemNoHistorico(leadId, 'operator', message);
+                
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+                console.log(`Mensagem manual enviada para ${number} pelo CRM.`);
+
+            } catch (error) {
+                console.error("Erro ao enviar mensagem manual:", error);
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: error.message }));
+            }
+        });
+        return;
+    }
+
     res.writeHead(404).end();
 });
 
@@ -105,6 +152,9 @@ client.on('message', async message => {
     console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
     if (message.isGroup) return;
 
+    let leadId = await encontrarOuCriarLead(contato);
+    if(leadId) await salvarMensagemNoHistorico(leadId, 'user', textoRecebido);
+
     let promptDoUsuario = PROMPT_PADRAO;
     try {
         if (crmUserId) {
@@ -141,21 +191,22 @@ client.on('message', async message => {
             dadosExtraidos = JSON.parse(respostaIA);
         } catch (e) {
             await client.sendMessage(contato, respostaIA);
+            if(leadId) await salvarMensagemNoHistorico(leadId, 'bot', respostaIA);
             return;
         }
 
         if (dadosExtraidos && dadosExtraidos.finalizado === true) {
-            console.log("Conversa finalizada. Tentando salvar no CRM...");
-            dadosExtraidos.whatsapp = contato.replace('@c.us', '');
+            console.log("Conversa finalizada. Atualizando lead no CRM...");
+            const leadData = dadosExtraidos.dados_cliente || dadosExtraidos;
+            leadData.whatsapp = contato.replace('@c.us', '');
             
-            const leadData = dadosExtraidos.dados_cliente || dadosExtraidos; // Compatibilidade com ambos os formatos de JSON
-            await adicionarLeadNoCRM(leadData);
+            await atualizarLead(leadId, leadData);
             
             const msgFinal = `Obrigado, ${leadData.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${leadData.assunto}".`;
             await client.sendMessage(contato, msgFinal);
+            if(leadId) await salvarMensagemNoHistorico(leadId, 'bot', msgFinal);
             delete conversas[contato];
         }
-
     } catch (error) {
         console.error("❌ Erro na comunicação com o Gemini:", error);
         conversas[contato].pop();
@@ -163,32 +214,69 @@ client.on('message', async message => {
     }
 });
 
-async function adicionarLeadNoCRM(dadosDoLead) {
+// === FUNÇÕES DO BANCO DE DADOS ===
+
+async function salvarMensagemNoHistorico(leadId, sender, text) {
+    if (!crmUserId || !leadId) return;
     try {
-        if (!crmUserId) {
-            console.error("❌ ERRO CRÍTICO: A variável de ambiente CRM_USER_ID não está configurada!");
-            return false;
-        }
-        const userDocRef = db.collection('userData').doc(crmUserId);
-        const userDoc = await userDocRef.get();
-        let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
-        const novoLead = {
-            id: leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0,
-            nome: dadosDoLead.nome || "Não informado",
-            whatsapp: dadosDoLead.whatsapp || "",
-            origem: "WhatsApp Bot",
-            status: "novo",
-            qualificacao: "quente",
-            notas: `[Lead criado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`,
-            email: ""
+        const messageData = {
+            sender, // 'user', 'bot', ou 'operator'
+            text,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
         };
-        leadsAtuais.push(novoLead);
-        await userDocRef.set({ leads: leadsAtuais }, { merge: true });
-        console.log(`✅ Lead "${novoLead.nome}" salvo com sucesso para o usuário ${crmUserId}!`);
-        return true;
+        // Salvando em uma subcoleção do documento do usuário
+        await db.collection('userData').doc(crmUserId).collection('leadsMessages').doc(String(leadId)).collection('messages').add(messageData);
     } catch (error) {
-        console.error("❌ Erro ao salvar lead no CRM:", error);
-        return false;
+        console.error(`Erro ao salvar mensagem para o lead ${leadId}:`, error);
+    }
+}
+
+async function encontrarOuCriarLead(whatsappNumber) {
+    if (!crmUserId) return null;
+    const whatsappId = whatsappNumber.replace('@c.us', '');
+    const userDocRef = db.collection('userData').doc(crmUserId);
+    
+    const userDoc = await userDocRef.get();
+    let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
+    
+    const leadExistente = leadsAtuais.find(l => l.whatsapp === whatsappId);
+    if (leadExistente) {
+        return String(leadExistente.id);
+    }
+
+    const novoLeadId = leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0;
+    const novoLead = {
+        id: novoLeadId,
+        nome: "Novo Contato",
+        whatsapp: whatsappId,
+        origem: "WhatsApp",
+        status: "novo",
+        qualificacao: "",
+        notas: "[Lead criado via Bot]",
+        email: ""
+    };
+
+    leadsAtuais.push(novoLead);
+    await userDocRef.set({ leads: leadsAtuais }, { merge: true });
+    console.log(`✅ Novo lead criado para ${whatsappId} com ID ${novoLeadId}`);
+    return String(novoLeadId);
+}
+
+async function atualizarLead(leadId, dadosDoLead) {
+    if (!crmUserId) return;
+    const userDocRef = db.collection('userData').doc(crmUserId);
+    const userDoc = await userDocRef.get();
+    
+    if (userDoc.exists) {
+        let leads = userDoc.data().leads || [];
+        const leadIndex = leads.findIndex(l => String(l.id) === String(leadId));
+
+        if (leadIndex > -1) {
+            leads[leadIndex].nome = dadosDoLead.nome || leads[leadIndex].nome;
+            leads[leadIndex].notas = `[Lead atualizado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`;
+            await userDocRef.update({ leads });
+            console.log(`✅ Lead ${leadId} atualizado com os dados do bot.`);
+        }
     }
 }
 
