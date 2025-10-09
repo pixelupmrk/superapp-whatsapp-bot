@@ -37,46 +37,44 @@ console.log('✅ Conectado à API do Gemini!');
 // === VARIÁVEIS DE ESTADO ===
 let qrCodeDataUrl = null;
 let botStatus = "Iniciando...";
+let clientReady = false;
 
 // === SERVIDOR WEB PARA EXIBIR O QR CODE ===
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    if (qrCodeDataUrl) {
-        res.end(`
-            <body style="background-color: #1a1a2e;">
-                <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
-                    <h1>Escaneie para Conectar</h1>
-                    <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
-                    <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px; background-color: white; padding: 10px; border-radius: 8px;">
-                    <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
-                </div>
-            </body>
-        `);
-    } else {
-        res.end(`
-            <body style="background-color: #1a1a2e;">
-                <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
-                    <h1>SuperApp WhatsApp Bot</h1>
-                    <p><strong>Status:</strong> ${botStatus}</p>
-                    <p>Se o QR Code não aparecer em 30 segundos, atualize a página. Se o status for 'Desconectado', reinicie o serviço no painel da Render.</p>
-                </div>
-            </body>
-        `);
+    if (req.url === '/' && req.method === 'GET') {
+        if (qrCodeDataUrl) {
+            res.end(`
+                <body style="background-color: #1a1a2e;">
+                    <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
+                        <h1>Escaneie para Conectar</h1>
+                        <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
+                        <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px; background-color: white; padding: 10px; border-radius: 8px;">
+                        <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
+                    </div>
+                </body>
+            `);
+        } else {
+            res.end(`
+                <body style="background-color: #1a1a2e;">
+                    <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
+                        <h1>SuperApp WhatsApp Bot</h1>
+                        <p><strong>Status:</strong> ${botStatus}</p>
+                        <p>Se o QR Code não aparecer em 30 segundos, atualize a página. Se o status for 'Desconectado', reinicie o serviço no painel da Render.</p>
+                    </div>
+                </body>
+            `);
+        }
+        return;
     }
+    res.writeHead(404).end();
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`✅ Servidor web rodando na porta ${PORT}. Acesse a URL do seu serviço para ver o QR Code.`);
-});
+server.listen(PORT, () => { console.log(`✅ Servidor web rodando na porta ${PORT}.`); });
 
 // === BOT DO WHATSAPP ===
-const client = new Client({
-    puppeteer: {
-        headless: true,
-        args: [ '--no-sandbox', '--disable-setuid-sandbox' ]
-    }
-});
+const client = new Client({ puppeteer: { headless: true, args: [ '--no-sandbox', '--disable-setuid-sandbox' ] } });
 
 client.on('qr', async (qr) => {
     console.log("QR Code recebido, gerando imagem...");
@@ -84,20 +82,22 @@ client.on('qr', async (qr) => {
     qrCodeDataUrl = await qrcode.toDataURL(qr);
 });
 
-client.on('ready', () => {
-    console.log('✅ Cliente WhatsApp conectado e pronto para trabalhar!');
+client.on('ready', () => { 
+    clientReady = true; 
     botStatus = "Conectado com sucesso! O bot já está funcionando.";
     qrCodeDataUrl = null; 
+    console.log('✅ Cliente WhatsApp conectado e pronto para trabalhar!'); 
 });
 
-client.on('disconnected', (reason) => {
-    console.log('❌ Cliente foi desconectado!', reason);
+client.on('disconnected', (reason) => { 
+    clientReady = false;
     botStatus = `Desconectado: ${reason}. Reiniciando...`;
+    console.log('❌ Cliente foi desconectado!', reason);
     client.initialize();
 });
 
 const conversas = {};
-let PROMPT_PADRAO = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
+const PROMPT_PADRAO = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
 
 client.on('message', async message => {
     const contato = message.from;
@@ -147,8 +147,11 @@ client.on('message', async message => {
         if (dadosExtraidos && dadosExtraidos.finalizado === true) {
             console.log("Conversa finalizada. Tentando salvar no CRM...");
             dadosExtraidos.whatsapp = contato.replace('@c.us', '');
-            await adicionarLeadNoCRM(dadosExtraidos);
-            const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
+            
+            const leadData = dadosExtraidos.dados_cliente || dadosExtraidos; // Compatibilidade com ambos os formatos de JSON
+            await adicionarLeadNoCRM(leadData);
+            
+            const msgFinal = `Obrigado, ${leadData.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${leadData.assunto}".`;
             await client.sendMessage(contato, msgFinal);
             delete conversas[contato];
         }
