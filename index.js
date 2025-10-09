@@ -10,6 +10,7 @@ console.log('Lendo variáveis de ambiente...');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 const firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
 const geminiApiKey = process.env.GEMINI_API_KEY;
+const crmUserId = process.env.CRM_USER_ID; // Pega o ID do usuário do CRM
 console.log('Variáveis lidas com sucesso.');
 
 // Inicializa Firebase
@@ -23,12 +24,13 @@ try {
     }
 } catch (error) {
     console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
+    process.exit(1); // Encerra o processo se não conseguir conectar ao DB
 }
+const db = admin.firestore();
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-// Alterado para 'gemini-2.5-flash' conforme solicitado
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
 console.log('✅ Conectado à API do Gemini!');
 
 // === VARIÁVEIS DE ESTADO ===
@@ -40,20 +42,24 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     if (qrCodeDataUrl) {
         res.end(`
-            <div style="font-family: sans-serif; text-align: center; padding: 40px;">
-                <h1>Escaneie para Conectar</h1>
-                <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
-                <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px;">
-                <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
-            </div>
+            <body style="background-color: #1a1a2e;">
+                <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
+                    <h1>Escaneie para Conectar</h1>
+                    <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
+                    <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px; background-color: white; padding: 10px; border-radius: 8px;">
+                    <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
+                </div>
+            </body>
         `);
     } else {
         res.end(`
-            <div style="font-family: sans-serif; text-align: center; padding: 40px;">
-                <h1>SuperApp WhatsApp Bot</h1>
-                <p><strong>Status:</strong> ${botStatus}</p>
-                 <p>Se o QR Code não aparecer em 30 segundos, atualize a página.</p>
-            </div>
+            <body style="background-color: #1a1a2e;">
+                <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
+                    <h1>SuperApp WhatsApp Bot</h1>
+                    <p><strong>Status:</strong> ${botStatus}</p>
+                    <p>Se o QR Code não aparecer em 30 segundos, atualize a página. Se o status for 'Desconectado', reinicie o serviço no painel da Render.</p>
+                </div>
+            </body>
         `);
     }
 });
@@ -63,21 +69,17 @@ server.listen(PORT, () => {
     console.log(`✅ Servidor web rodando na porta ${PORT}. Acesse a URL do seu serviço para ver o QR Code.`);
 });
 
-
 // === BOT DO WHATSAPP ===
 const client = new Client({
     puppeteer: {
         headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox'
-        ]
+        args: [ '--no-sandbox', '--disable-setuid-sandbox' ]
     }
 });
 
 client.on('qr', async (qr) => {
     console.log("QR Code recebido, gerando imagem...");
-    botStatus = "Aguardando escaneamento do QR Code. Acesse a URL do seu bot para escanear.";
+    botStatus = "Aguardando escaneamento do QR Code.";
     qrCodeDataUrl = await qrcode.toDataURL(qr);
 });
 
@@ -94,23 +96,8 @@ client.on('disconnected', (reason) => {
 });
 
 const conversas = {};
-const PROMPT_ASSISTENTE = `
-Você é um assistente virtual para a PixelUp. Sua função é fazer o pré-atendimento de novos clientes via WhatsApp.
-Seu objetivo é extrair 4 informações: NOME, ASSUNTO, ORÇAMENTO e PRAZO.
-Siga estas regras estritamente:
-1. Seja sempre cordial e prestativo.
-2. Faça uma pergunta de cada vez para não confundir o cliente.
-3. Quando você tiver todas as 4 informações, finalize a conversa agradecendo e dizendo que um especialista entrará em contato em breve.
-4. Após finalizar, sua resposta DEVE SER APENAS um objeto JSON válido, sem nenhum texto adicional antes ou depois. O JSON deve ter a seguinte estrutura:
-   {
-     "finalizado": true,
-     "nome": "Nome do Cliente",
-     "assunto": "Assunto ou serviço desejado",
-     "orcamento": "Valor ou faixa de orçamento",
-     "prazo": "Prazo desejado"
-   }
-5. Se você ainda não tem todas as informações, apenas continue a conversa normalmente. NÃO retorne um JSON.
-`;
+// O prompt padrão, caso o usuário ainda não tenha configurado um
+const PROMPT_PADRAO = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
 
 client.on('message', async message => {
     const contato = message.from;
@@ -118,49 +105,55 @@ client.on('message', async message => {
     console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
     if (message.isGroup) return;
 
+    // Carrega o prompt personalizado do Firebase
+    let promptDoUsuario = PROMPT_PADRAO;
+    try {
+        const userDoc = await db.collection('userData').doc(crmUserId).get();
+        if (userDoc.exists && userDoc.data().botPrompt) {
+            promptDoUsuario = userDoc.data().botPrompt;
+            console.log("Prompt personalizado carregado para o usuário.");
+        } else {
+            console.log("Nenhum prompt personalizado encontrado, usando o padrão.");
+        }
+    } catch (error) {
+        console.error("Erro ao carregar prompt do usuário, usando o padrão:", error);
+    }
+
     if (!conversas[contato]) {
         conversas[contato] = [
-            { role: "user", parts: [{ text: PROMPT_ASSISTENTE }] },
+            { role: "user", parts: [{ text: promptDoUsuario }] },
             { role: "model", parts: [{ text: "Ok, entendi minhas instruções. Estou pronto para começar." }] }
         ];
     }
     
-    // Adiciona a nova mensagem do usuário ao histórico para enviar para a IA
     conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
 
     try {
         const result = await geminiModel.generateContent({ contents: conversas[contato] });
         const respostaIA = result.response.text();
         console.log(`Resposta da IA: "${respostaIA}"`);
-
-        // Adiciona a resposta da IA ao histórico para a próxima rodada
+        
         conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
 
         let dadosExtraidos;
         try {
             dadosExtraidos = JSON.parse(respostaIA);
         } catch (e) {
-            // Se não for um JSON, é uma continuação da conversa. Apenas envia a resposta.
             await client.sendMessage(contato, respostaIA);
             return;
         }
 
-        // Se for um JSON e estiver finalizado, executa as ações finais.
         if (dadosExtraidos && dadosExtraidos.finalizado === true) {
             console.log("Conversa finalizada. Tentando salvar no CRM...");
             dadosExtraidos.whatsapp = contato.replace('@c.us', '');
-            
             await adicionarLeadNoCRM(dadosExtraidos);
-            
             const msgFinal = `Obrigado, ${dadosExtraidos.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${dadosExtraidos.assunto}".`;
             await client.sendMessage(contato, msgFinal);
-
-            delete conversas[contato]; // Limpa a conversa da memória
+            delete conversas[contato];
         }
 
     } catch (error) {
         console.error("❌ Erro na comunicação com o Gemini:", error);
-        // Remove a última mensagem do usuário do histórico, pois a IA falhou em responder
         conversas[contato].pop();
         await client.sendMessage(contato, "Desculpe, estou com um problema técnico no momento. Tente novamente mais tarde.");
     }
@@ -168,13 +161,13 @@ client.on('message', async message => {
 
 async function adicionarLeadNoCRM(dadosDoLead) {
     try {
-        const userId = "bSqhMhT6o6Zg0u3bCMT2w5i7c8C2";
-        if (!userId) throw new Error("UID do usuário não definido!");
-        
-        const userDocRef = db.collection('userData').doc(userId);
+        if (!crmUserId) {
+            console.error("❌ ERRO CRÍTICO: A variável de ambiente CRM_USER_ID não está configurada!");
+            return false;
+        }
+        const userDocRef = db.collection('userData').doc(crmUserId);
         const userDoc = await userDocRef.get();
         let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
-        
         const novoLead = {
             id: leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0,
             nome: dadosDoLead.nome || "Não informado",
@@ -185,10 +178,9 @@ async function adicionarLeadNoCRM(dadosDoLead) {
             notas: `[Lead criado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`,
             email: ""
         };
-
         leadsAtuais.push(novoLead);
         await userDocRef.set({ leads: leadsAtuais }, { merge: true });
-        console.log(`✅ Lead "${novoLead.nome}" salvo com sucesso no CRM!`);
+        console.log(`✅ Lead "${novoLead.nome}" salvo com sucesso para o usuário ${crmUserId}!`);
         return true;
     } catch (error) {
         console.error("❌ Erro ao salvar lead no CRM:", error);
