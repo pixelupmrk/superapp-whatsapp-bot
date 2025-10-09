@@ -41,7 +41,6 @@ let clientReady = false;
 
 // === SERVIDOR WEB PARA EXIBIR O QR CODE E RECEBER COMANDOS ===
 const server = http.createServer(async (req, res) => {
-    // Permite CORS para que o seu SuperApp possa se comunicar com o bot
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -52,7 +51,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Rota para exibir o QR Code ou Status
     if (req.url === '/' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         if (qrCodeDataUrl) {
@@ -80,7 +78,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Rota para o Super App enviar mensagens
     if (req.url === '/send-message' && req.method === 'POST') {
         if (!clientReady) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -152,18 +149,15 @@ client.on('message', async message => {
     console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
     if (message.isGroup) return;
 
-    let leadId = await encontrarOuCriarLead(contato);
+    const leadId = await encontrarOuCriarLead(contato);
     if(leadId) await salvarMensagemNoHistorico(leadId, 'user', textoRecebido);
 
     let promptDoUsuario = PROMPT_PADRAO;
     try {
         if (crmUserId) {
-            const userDoc = await db.collection('userData').doc(crmUserId).get();
+            const userDoc = await db.collection('users').doc(crmUserId).get();
             if (userDoc.exists && userDoc.data().botPrompt) {
                 promptDoUsuario = userDoc.data().botPrompt;
-                console.log("Prompt personalizado carregado para o usuário.");
-            } else {
-                console.log("Nenhum prompt personalizado encontrado para o usuário, usando o padrão.");
             }
         }
     } catch (error) {
@@ -220,12 +214,9 @@ async function salvarMensagemNoHistorico(leadId, sender, text) {
     if (!crmUserId || !leadId) return;
     try {
         const messageData = {
-            sender, // 'user', 'bot', ou 'operator'
-            text,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
+            sender, text, timestamp: admin.firestore.FieldValue.serverTimestamp()
         };
-        // Salvando em uma subcoleção do documento do usuário
-        await db.collection('userData').doc(crmUserId).collection('leadsMessages').doc(String(leadId)).collection('messages').add(messageData);
+        await db.collection('users').doc(crmUserId).collection('leads').doc(leadId).collection('messages').add(messageData);
     } catch (error) {
         console.error(`Erro ao salvar mensagem para o lead ${leadId}:`, error);
     }
@@ -234,50 +225,30 @@ async function salvarMensagemNoHistorico(leadId, sender, text) {
 async function encontrarOuCriarLead(whatsappNumber) {
     if (!crmUserId) return null;
     const whatsappId = whatsappNumber.replace('@c.us', '');
-    const userDocRef = db.collection('userData').doc(crmUserId);
+    const leadsCollection = db.collection('users').doc(crmUserId).collection('leads');
+    const snapshot = await leadsCollection.where('whatsapp', '==', whatsappId).limit(1).get();
     
-    const userDoc = await userDocRef.get();
-    let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
-    
-    const leadExistente = leadsAtuais.find(l => l.whatsapp === whatsappId);
-    if (leadExistente) {
-        return String(leadExistente.id);
+    if (!snapshot.empty) {
+        return snapshot.docs[0].id;
     }
 
-    const novoLeadId = leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0;
     const novoLead = {
-        id: novoLeadId,
-        nome: "Novo Contato",
-        whatsapp: whatsappId,
-        origem: "WhatsApp",
-        status: "novo",
-        qualificacao: "",
-        notas: "[Lead criado via Bot]",
-        email: ""
+        nome: "Novo Contato", whatsapp: whatsappId, origem: "WhatsApp", status: "novo"
     };
-
-    leadsAtuais.push(novoLead);
-    await userDocRef.set({ leads: leadsAtuais }, { merge: true });
-    console.log(`✅ Novo lead criado para ${whatsappId} com ID ${novoLeadId}`);
-    return String(novoLeadId);
+    const newDocRef = await leadsCollection.add(novoLead);
+    console.log(`✅ Novo lead criado para ${whatsappId} com ID ${newDocRef.id}`);
+    return newDocRef.id;
 }
 
 async function atualizarLead(leadId, dadosDoLead) {
-    if (!crmUserId) return;
-    const userDocRef = db.collection('userData').doc(crmUserId);
-    const userDoc = await userDocRef.get();
-    
-    if (userDoc.exists) {
-        let leads = userDoc.data().leads || [];
-        const leadIndex = leads.findIndex(l => String(l.id) === String(leadId));
-
-        if (leadIndex > -1) {
-            leads[leadIndex].nome = dadosDoLead.nome || leads[leadIndex].nome;
-            leads[leadIndex].notas = `[Lead atualizado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`;
-            await userDocRef.update({ leads });
-            console.log(`✅ Lead ${leadId} atualizado com os dados do bot.`);
-        }
-    }
+    if (!crmUserId || !leadId) return;
+    const leadRef = db.collection('users').doc(crmUserId).collection('leads').doc(leadId);
+    const leadUpdateData = {
+        nome: dadosDoLead.nome,
+        notas: `[Lead atualizado via Bot]\nAssunto: ${dadosDoLead.assunto}\nOrçamento: ${dadosDoLead.orcamento}\nPrazo: ${dadosDoLead.prazo}`
+    };
+    await leadRef.update(leadUpdateData);
+    console.log(`✅ Lead ${leadId} atualizado com os dados do bot.`);
 }
 
 console.log("Iniciando o cliente WhatsApp...");
