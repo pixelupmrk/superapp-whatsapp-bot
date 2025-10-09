@@ -10,7 +10,7 @@ console.log('Lendo variáveis de ambiente...');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 const firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
 const geminiApiKey = process.env.GEMINI_API_KEY;
-const crmUserId = process.env.CRM_USER_ID; // Pega o ID do usuário do CRM
+const crmUserId = process.env.CRM_USER_ID;
 console.log('Variáveis lidas com sucesso.');
 
 // Inicializa Firebase
@@ -24,13 +24,14 @@ try {
     }
 } catch (error) {
     console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
-    process.exit(1); // Encerra o processo se não conseguir conectar ao DB
+    process.exit(1);
 }
 const db = admin.firestore();
 
 // Inicializa Gemini
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+// Alterado para 'gemini-2.5-flash' conforme solicitado
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 console.log('✅ Conectado à API do Gemini!');
 
 // === VARIÁVEIS DE ESTADO ===
@@ -96,8 +97,7 @@ client.on('disconnected', (reason) => {
 });
 
 const conversas = {};
-// O prompt padrão, caso o usuário ainda não tenha configurado um
-const PROMPT_PADRAO = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
+let PROMPT_PADRAO = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
 
 client.on('message', async message => {
     const contato = message.from;
@@ -105,15 +105,16 @@ client.on('message', async message => {
     console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
     if (message.isGroup) return;
 
-    // Carrega o prompt personalizado do Firebase
     let promptDoUsuario = PROMPT_PADRAO;
     try {
-        const userDoc = await db.collection('userData').doc(crmUserId).get();
-        if (userDoc.exists && userDoc.data().botPrompt) {
-            promptDoUsuario = userDoc.data().botPrompt;
-            console.log("Prompt personalizado carregado para o usuário.");
-        } else {
-            console.log("Nenhum prompt personalizado encontrado, usando o padrão.");
+        if (crmUserId) {
+            const userDoc = await db.collection('userData').doc(crmUserId).get();
+            if (userDoc.exists && userDoc.data().botPrompt) {
+                promptDoUsuario = userDoc.data().botPrompt;
+                console.log("Prompt personalizado carregado para o usuário.");
+            } else {
+                console.log("Nenhum prompt personalizado encontrado para o usuário, usando o padrão.");
+            }
         }
     } catch (error) {
         console.error("Erro ao carregar prompt do usuário, usando o padrão:", error);
