@@ -253,4 +253,4 @@ async function atualizarLead(leadId, dadosDoLead) {
 
 console.log("Iniciando o cliente WhatsApp...");
 client.initialize();
-npm install cors
+
