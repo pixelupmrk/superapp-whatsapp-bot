@@ -10,6 +10,7 @@
     "@google/generative-ai": "^0.8.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "qrcode": "^1.5.3",
     "whatsapp-web.js": "^1.23.0"
   }
 }
