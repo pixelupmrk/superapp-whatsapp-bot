@@ -38,17 +38,8 @@ function createWhatsappClient(userId) {
     console.log(`[Sistema] Criando cliente de WhatsApp para: ${userId}`);
     const client = new Client({ authStrategy: new LocalAuth({ clientId: userId }), puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] } });
 
-    client.on('qr', (qr) => {
-        qrcode.toDataURL(qr, (err, url) => {
-            if (err) return;
-            sendEventToUser(userId, { type: 'qr', data: url });
-        });
-    });
-
-    client.on('ready', () => {
-        console.log(`[WhatsApp - ${userId}] Cliente conectado!`);
-        sendEventToUser(userId, { type: 'status', data: 'Conectado ao WhatsApp!' });
-    });
+    client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
+    client.on('ready', () => sendEventToUser(userId, { type: 'status', data: 'Conectado ao WhatsApp!' }));
 
     client.on('message', async (message) => {
         const userContact = message.from;
@@ -57,26 +48,35 @@ function createWhatsappClient(userId) {
 
         try {
             const userDocRef = db.collection('userData').doc(userId);
-            const userDoc = await userDoc.get();
-            const userData = userDoc.exists ? userDoc.data() : { leads: [] };
-            let leads = userData.leads || [];
+            const userDoc = await userDocRef.get();
+            if (!userDoc.exists) {
+                console.log(`[Sistema - ${userId}] Documento do usuário não encontrado.`);
+                return;
+            }
             
-            // <<< AQUI ESTÁ A MELHORIA DO TREINAMENTO >>>
-            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
-
+            let userData = userDoc.data();
+            let leads = userData.leads || [];
             let currentLead = leads.find(lead => lead.whatsapp === userContact);
             let leadId;
 
+            // Lógica para não responder se o bot estiver desativado para este lead
+            if (currentLead && currentLead.botActive === false) {
+                console.log(`[Bot - ${userId}] Bot desativado para o lead ${currentLead.nome}. Ignorando mensagem.`);
+                return;
+            }
+
             if (!currentLead) {
+                console.log(`[CRM - ${userId}] Novo contato!`);
                 const prompt = `Analise a mensagem: "${message.body}". Extraia o nome do remetente. Responda apenas o nome. Se não achar, responda "Novo Contato".`;
                 const leadName = (await (await model.generateContent(prompt)).response).text().trim();
                 
                 const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
-                const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo' };
+                const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true }; // Adiciona botActive como true por padrão
                 leadId = nextId;
-
-                await userDocRef.set({ leads: FieldValue.arrayUnion(newLead) }, { merge: true });
+                
+                await userDocRef.update({ leads: FieldValue.arrayUnion(newLead) });
                 console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado!`);
+                currentLead = newLead; // Define o lead atual para salvar o histórico
             } else {
                 leadId = currentLead.id;
             }
@@ -84,10 +84,10 @@ function createWhatsappClient(userId) {
             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
                       .collection('messages').add({ text: message.body, sender: 'lead', timestamp: new Date() });
 
-            // <<< AQUI USAMOS O TREINAMENTO PARA RESPONDER >>>
-            const fullPrompt = `${botInstructions}\n\n--- INSTRUÇÕES ADICIONAIS ---\nNunca se identifique como uma IA ou modelo de linguagem. Aja como a personalidade descrita acima.\n\n--- MENSAGEM DO CLIENTE ---\n${message.body}`;
-            
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${message.body}"`;
             const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+            
             await message.reply(aiResponse);
 
             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
@@ -115,18 +115,9 @@ app.get('/events', (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
     frontendConnections[userId] = { res };
-    console.log(`[Servidor] Frontend de ${userId} conectado.`);
-    if (!whatsappClients[userId]) {
-        createWhatsappClient(userId);
-    } else {
-        sendEventToUser(userId, { type: 'status', data: 'Conexão já estabelecida.' });
-    }
-    req.on('close', () => {
-        console.log(`[Servidor] Frontend de ${userId} desconectado.`);
-        delete frontendConnections[userId];
-    });
+    if (!whatsappClients[userId]) createWhatsappClient(userId);
+    else sendEventToUser(userId, { type: 'status', data: 'Conexão já estabelecida.' });
+    req.on('close', () => delete frontendConnections[userId]);
 });
 
-app.listen(port, () => {
-    console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`);
-});
+app.listen(port, () => console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`));
