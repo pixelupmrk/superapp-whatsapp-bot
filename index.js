@@ -1,24 +1,24 @@
 const express = require('express');
-const cors = require('cors'); // Dependência para corrigir o erro de conexão
+const cors = require('cors');
 const qrcode = require('qrcode');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// --- Configuração do Firebase Admin (se você usa no backend) ---
-// Se você não usa, pode remover esta parte.
-// const serviceAccount = require('./caminho/para/seu/arquivo-de-credenciais.json');
-// initializeApp({ credential: cert(serviceAccount) });
-// const db = getFirestore();
-// --------------------------------------------------------------------
+// --- Configuração da IA do Gemini ---
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) {
+    console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada no Render.");
+}
+const genAI = new GoogleGenerativeAI(apiKey);
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+// ------------------------------------
 
 const app = express();
-app.use(cors()); // Linha MAIS IMPORTANTE: Habilita o CORS para aceitar conexões
+app.use(cors());
 app.use(express.json());
 
 const port = process.env.PORT || 10000;
 
-// Inicia o cliente do WhatsApp
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
@@ -29,10 +29,8 @@ const client = new Client({
 
 client.initialize();
 
-// --- Armazenamento dos eventos para o frontend ---
-let clients = []; // Lista de conexões do frontend
+let clients = [];
 
-// Endpoint para o frontend se conectar e ouvir os eventos
 app.get('/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -40,11 +38,7 @@ app.get('/events', (req, res) => {
     res.flushHeaders();
 
     const clientId = Date.now();
-    const newClient = {
-        id: clientId,
-        res
-    };
-    clients.push(newClient);
+    clients.push({ id: clientId, res });
     console.log(`[Servidor] Cliente ${clientId} conectado.`);
 
     req.on('close', () => {
@@ -53,20 +47,15 @@ app.get('/events', (req, res) => {
     });
 });
 
-// Função para enviar eventos para todos os frontends conectados
 function sendEvent(data) {
     const eventString = `data: ${JSON.stringify(data)}\n\n`;
     clients.forEach(client => client.res.write(eventString));
 }
 
-// --- Eventos do WhatsApp ---
 client.on('qr', (qr) => {
     console.log('[WhatsApp] QR Code recebido, gerando imagem...');
     qrcode.toDataURL(qr, (err, url) => {
-        if (err) {
-            console.error('[QRCode] Erro ao gerar QR Code:', err);
-            return;
-        }
+        if (err) return console.error('[QRCode] Erro ao gerar QR Code:', err);
         sendEvent({ type: 'qr', data: url });
     });
 });
@@ -76,12 +65,33 @@ client.on('ready', () => {
     sendEvent({ type: 'status', data: 'Conectado ao WhatsApp!' });
 });
 
-client.on('message', message => {
-	console.log('[WhatsApp] Mensagem recebida:', message.body);
-	if(message.body === '!ping') {
-		message.reply('pong');
-	}
+// --- LÓGICA DE RESPOSTA DO BOT ---
+client.on('message', async (message) => {
+    const userMessage = message.body;
+    console.log(`[WhatsApp] Mensagem recebida de ${message.from}: ${userMessage}`);
+
+    // Ignora mensagens de status, grupos e as próprias mensagens do bot
+    if (message.isStatus || message.from.includes('@g.us') || message.fromMe) {
+        return;
+    }
+
+    try {
+        // Envia a mensagem do usuário para a IA
+        console.log('[Gemini] Enviando prompt para a IA...');
+        const result = await model.generateContent(userMessage);
+        const response = await result.response;
+        const aiResponse = response.text();
+        
+        // Envia a resposta da IA de volta para o usuário no WhatsApp
+        console.log(`[Gemini] Resposta da IA: ${aiResponse}`);
+        await message.reply(aiResponse);
+
+    } catch (error) {
+        console.error('[Gemini] Erro ao processar a mensagem com a IA:', error);
+        await message.reply("Desculpe, estou com um problema para me conectar à minha inteligência. Tente novamente em alguns instantes.");
+    }
 });
+// ---------------------------------
 
 app.listen(port, () => {
     console.log(`[Servidor] Servidor web rodando na porta ${port}.`);
