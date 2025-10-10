@@ -254,3 +254,11 @@ async function atualizarLead(leadId, dadosDoLead) {
 console.log("Iniciando o cliente WhatsApp...");
 client.initialize();
 
+const express = require('express');
+const cors = require('cors');
+const app = express();
+
+// Adicione esta linha para permitir conexões de qualquer origem
+app.use(cors()); 
+
+// O resto do seu código continua aqui...
