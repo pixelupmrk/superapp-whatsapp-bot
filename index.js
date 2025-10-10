@@ -9,6 +9,14 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 console.log('Lendo variáveis de ambiente...');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 const firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
+const express = require('express');
+const cors = require('cors');
+const app = express();
+
+// Adicione esta linha para permitir conexões de qualquer origem
+app.use(cors()); 
+
+// O resto do seu código continua aqui...
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const crmUserId = process.env.CRM_USER_ID;
 console.log('Variáveis lidas com sucesso.');
@@ -254,11 +262,3 @@ async function atualizarLead(leadId, dadosDoLead) {
 console.log("Iniciando o cliente WhatsApp...");
 client.initialize();
 
-const express = require('express');
-const cors = require('cors');
-const app = express();
-
-// Adicione esta linha para permitir conexões de qualquer origem
-app.use(cors()); 
-
-// O resto do seu código continua aqui...
