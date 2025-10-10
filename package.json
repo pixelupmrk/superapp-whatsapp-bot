@@ -1,16 +1,15 @@
 {
-  "name": "superapp-whatsapp-bot",
+  "name": "superapp-backend",
   "version": "1.0.0",
-  "description": "Bot de atendimento para o SuperApp",
+  "description": "Backend para o SuperApp",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.8.0",
-    "firebase-admin": "^12.0.0",
-    "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "latest"
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "whatsapp-web.js": "^1.23.0"
   }
 }
