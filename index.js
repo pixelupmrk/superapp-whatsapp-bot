@@ -39,7 +39,6 @@ function createWhatsappClient(userId) {
     const client = new Client({ authStrategy: new LocalAuth({ clientId: userId }), puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] } });
 
     client.on('qr', (qr) => {
-        console.log(`[WhatsApp - ${userId}] QR Code recebido.`);
         qrcode.toDataURL(qr, (err, url) => {
             if (err) return;
             sendEventToUser(userId, { type: 'qr', data: url });
@@ -58,15 +57,17 @@ function createWhatsappClient(userId) {
 
         try {
             const userDocRef = db.collection('userData').doc(userId);
-            const userDoc = await userDocRef.get();
+            const userDoc = await userDoc.get();
             const userData = userDoc.exists ? userDoc.data() : { leads: [] };
             let leads = userData.leads || [];
             
+            // <<< AQUI ESTÁ A MELHORIA DO TREINAMENTO >>>
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+
             let currentLead = leads.find(lead => lead.whatsapp === userContact);
             let leadId;
 
             if (!currentLead) {
-                console.log(`[CRM - ${userId}] Novo contato!`);
                 const prompt = `Analise a mensagem: "${message.body}". Extraia o nome do remetente. Responda apenas o nome. Se não achar, responda "Novo Contato".`;
                 const leadName = (await (await model.generateContent(prompt)).response).text().trim();
                 
@@ -80,16 +81,16 @@ function createWhatsappClient(userId) {
                 leadId = currentLead.id;
             }
 
-            // Salva a mensagem do cliente no histórico do lead no Firebase
             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
                       .collection('messages').add({ text: message.body, sender: 'lead', timestamp: new Date() });
 
-            // Gera e envia a resposta da IA
-            const aiResponse = (await (await model.generateContent(message.body)).response).text();
+            // <<< AQUI USAMOS O TREINAMENTO PARA RESPONDER >>>
+            const fullPrompt = `${botInstructions}\n\n--- INSTRUÇÕES ADICIONAIS ---\nNunca se identifique como uma IA ou modelo de linguagem. Aja como a personalidade descrita acima.\n\n--- MENSAGEM DO CLIENTE ---\n${message.body}`;
+            
+            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
             await message.reply(aiResponse);
 
-            // Salva a resposta do bot no histórico do lead no Firebase
-             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
+            await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
                       .collection('messages').add({ text: aiResponse, sender: 'operator', timestamp: new Date() });
 
         } catch (error) {
