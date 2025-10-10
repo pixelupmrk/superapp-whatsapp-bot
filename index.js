@@ -6,9 +6,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // --- Configuração da IA do Gemini ---
 const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-    console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada no Render.");
-}
+if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada no Render.");
 const genAI = new GoogleGenerativeAI(apiKey);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 // ------------------------------------
@@ -19,81 +17,102 @@ app.use(express.json());
 
 const port = process.env.PORT || 10000;
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+// Objeto para gerenciar múltiplos clientes de WhatsApp
+// A chave será o ID do usuário (ex: "user-abc-123")
+const whatsappClients = {};
+const frontendConnections = {}; // Armazena as conexões SSE dos frontends
+
+// Função para enviar eventos para um frontend específico
+function sendEventToUser(userId, data) {
+    if (frontendConnections[userId]) {
+        const eventString = `data: ${JSON.stringify(data)}\n\n`;
+        frontendConnections[userId].res.write(eventString);
     }
-});
+}
 
-client.initialize();
+// Função para criar e inicializar um novo cliente de WhatsApp para um usuário
+function createWhatsappClient(userId) {
+    console.log(`[Sistema] Criando novo cliente de WhatsApp para o usuário: ${userId}`);
+    
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId: userId }), // Salva a sessão em uma pasta única para este usuário
+        puppeteer: {
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        }
+    });
 
-let clients = [];
+    client.on('qr', (qr) => {
+        console.log(`[WhatsApp - ${userId}] QR Code recebido.`);
+        qrcode.toDataURL(qr, (err, url) => {
+            if (err) return console.error(`[QRCode - ${userId}] Erro ao gerar QR Code:`, err);
+            sendEventToUser(userId, { type: 'qr', data: url });
+        });
+    });
 
+    client.on('ready', () => {
+        console.log(`[WhatsApp - ${userId}] Cliente está pronto e conectado!`);
+        sendEventToUser(userId, { type: 'status', data: 'Conectado ao WhatsApp!' });
+    });
+
+    client.on('message', async (message) => {
+        const userMessage = message.body;
+        console.log(`[WhatsApp - ${userId}] Mensagem recebida de ${message.from}: ${userMessage}`);
+        if (message.isStatus || message.from.includes('@g.us') || message.fromMe) return;
+
+        try {
+            const result = await model.generateContent(userMessage);
+            const response = await result.response;
+            const aiResponse = response.text();
+            console.log(`[Gemini - ${userId}] Resposta da IA: ${aiResponse}`);
+            await message.reply(aiResponse);
+        } catch (error) {
+            console.error(`[Gemini - ${userId}] Erro:`, error);
+            await message.reply("Desculpe, estou com um problema para me conectar à minha inteligência.");
+        }
+    });
+    
+    client.on('disconnected', (reason) => {
+        console.log(`[WhatsApp - ${userId}] Cliente foi desconectado! Razão:`, reason);
+        delete whatsappClients[userId]; // Remove da lista para poder reconectar
+    });
+
+    client.initialize();
+    whatsappClients[userId] = client;
+    return client;
+}
+
+
+// Endpoint para o frontend se conectar e ouvir os eventos
+// Agora ele espera um ID de usuário: /events?userId=abc-123
 app.get('/events', (req, res) => {
+    const userId = req.query.userId;
+    if (!userId) {
+        return res.status(400).json({ error: 'userId é obrigatório' });
+    }
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const clientId = Date.now();
-    clients.push({ id: clientId, res });
-    console.log(`[Servidor] Cliente ${clientId} conectado.`);
+    frontendConnections[userId] = { res };
+    console.log(`[Servidor] Frontend do usuário ${userId} conectado.`);
+
+    // Inicia a conexão do WhatsApp para este usuário se ainda não existir
+    if (!whatsappClients[userId]) {
+        createWhatsappClient(userId);
+    } else {
+        // Se já existe, envia o status atual
+        sendEventToUser(userId, { type: 'status', data: 'Conexão já estabelecida.' });
+    }
 
     req.on('close', () => {
-        console.log(`[Servidor] Cliente ${clientId} desconectado.`);
-        clients = clients.filter(c => c.id !== clientId);
+        console.log(`[Servidor] Frontend do usuário ${userId} desconectado.`);
+        delete frontendConnections[userId];
     });
 });
-
-function sendEvent(data) {
-    const eventString = `data: ${JSON.stringify(data)}\n\n`;
-    clients.forEach(client => client.res.write(eventString));
-}
-
-client.on('qr', (qr) => {
-    console.log('[WhatsApp] QR Code recebido, gerando imagem...');
-    qrcode.toDataURL(qr, (err, url) => {
-        if (err) return console.error('[QRCode] Erro ao gerar QR Code:', err);
-        sendEvent({ type: 'qr', data: url });
-    });
-});
-
-client.on('ready', () => {
-    console.log('[WhatsApp] Cliente está pronto e conectado!');
-    sendEvent({ type: 'status', data: 'Conectado ao WhatsApp!' });
-});
-
-// --- LÓGICA DE RESPOSTA DO BOT ---
-client.on('message', async (message) => {
-    const userMessage = message.body;
-    console.log(`[WhatsApp] Mensagem recebida de ${message.from}: ${userMessage}`);
-
-    // Ignora mensagens de status, grupos e as próprias mensagens do bot
-    if (message.isStatus || message.from.includes('@g.us') || message.fromMe) {
-        return;
-    }
-
-    try {
-        // Envia a mensagem do usuário para a IA
-        console.log('[Gemini] Enviando prompt para a IA...');
-        const result = await model.generateContent(userMessage);
-        const response = await result.response;
-        const aiResponse = response.text();
-        
-        // Envia a resposta da IA de volta para o usuário no WhatsApp
-        console.log(`[Gemini] Resposta da IA: ${aiResponse}`);
-        await message.reply(aiResponse);
-
-    } catch (error) {
-        console.error('[Gemini] Erro ao processar a mensagem com a IA:', error);
-        await message.reply("Desculpe, estou com um problema para me conectar à minha inteligência. Tente novamente em alguns instantes.");
-    }
-});
-// ---------------------------------
 
 app.listen(port, () => {
-    console.log(`[Servidor] Servidor web rodando na porta ${port}.`);
-    console.log(`[Servidor] Seu serviço está no ar ✨`);
+    console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`);
 });
