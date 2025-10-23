@@ -1,7 +1,7 @@
 {
-  "name": "superapp-backend",
-  "version": "1.0.0",
-  "description": "Backend para o SuperApp",
+  "name": "superapp-backend-baileys",
+  "version": "2.0.0",
+  "description": "Backend leve para o SuperApp usando Baileys",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "firebase-admin": "^12.1.0",
     "qrcode": "^1.5.3",
-    "whatsapp-web.js": "^1.23.0"
+    "@whiskeysockets/baileys": "6.5.0",
+    "pino": "8.14.1"
   }
 }
