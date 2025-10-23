@@ -9,14 +9,12 @@ const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 // --- Configuração do Firebase Admin ---
 let db;
 try {
-    // Certifique-se de que FIREBASE_SERVICE_ACCOUNT está configurado no Render
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     initializeApp({ credential: cert(serviceAccount) });
     db = getFirestore();
     console.log("[Firebase] Conectado ao Firebase Admin!");
 } catch (error) {
     console.error("[Firebase] ERRO: Verifique a variável de ambiente FIREBASE_SERVICE_ACCOUNT.", error);
-    // Permite que o servidor Express inicie mesmo se o Firebase Admin falhar.
 }
 
 // --- Configuração da IA ---
@@ -27,7 +25,6 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // --- Configuração do Servidor Express ---
 const app = express();
-// Configura CORS para permitir acesso de qualquer origem (NECESSÁRIO para o Vercel)
 app.use(cors({ origin: true })); 
 app.use(express.json());
 
@@ -58,12 +55,11 @@ function getOrCreateWhatsappClient(userId) {
         } 
     });
 
+    // Eventos
     client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
-    
     client.on('ready', () => {
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
-    
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
@@ -97,7 +93,6 @@ function getOrCreateWhatsappClient(userId) {
             if (!currentLead) {
                 console.log(`[CRM - ${userId}] Novo contato!`);
                 
-                // Puxa as instruções de IA salvas pelo usuário
                 const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
                 const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${message.body}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
                 
@@ -107,7 +102,6 @@ function getOrCreateWhatsappClient(userId) {
                 const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true }; 
                 leadId = nextId;
                 
-                // Salva o novo lead no array do usuário no Firestore
                 await userDocRef.update({ leads: FieldValue.arrayUnion(newLead) });
                 console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado!`);
                 currentLead = newLead; 
@@ -143,7 +137,6 @@ function getOrCreateWhatsappClient(userId) {
 
 // --- Endpoints para o Frontend (Super App) ---
 
-// NOVO ENDPOINT: Status do Bot (retorna JSON para o Frontend)
 app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) {
@@ -163,7 +156,6 @@ app.get('/status', async (req, res) => {
                 status: isConnected ? 'CONNECTED' : state
             });
         } catch (e) {
-            // Se getState falhar (cliente ainda não inicializado ou erro)
             return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline.' });
         }
     } else {
@@ -173,7 +165,6 @@ app.get('/status', async (req, res) => {
     }
 });
 
-// NOVO ENDPOINT: Envio de Mensagem (POST /send)
 app.post('/send', async (req, res) => {
     const { to, text, userId } = req.body;
     if (!to || !text || !userId) {
@@ -208,13 +199,12 @@ app.get('/events', (req, res) => {
     res.flushHeaders();
     frontendConnections[userId] = { res };
 
-    // Inicia o cliente se não estiver rodando (isso fará o cliente emitir o status e o QR Code, se necessário)
     getOrCreateWhatsappClient(userId);
 
     req.on('close', () => delete frontendConnections[userId]);
 });
 
-// Endpoint de boas-vindas (para evitar o erro HTML no /status)
+// Endpoint de boas-vindas para evitar erros 404/HTML no Render
 app.get('/', (req, res) => {
     res.status(200).json({ status: "Bot está ativo. Use /status ou /events." });
 });
