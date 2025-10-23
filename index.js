@@ -44,6 +44,7 @@ function sendEventToUser(userId, data) {
 
 // Obtém o cliente de WhatsApp, criando-o e inicializando-o se não existir
 function getOrCreateWhatsappClient(userId) {
+    // CORRIGIDO: Se o cliente já existe e está pronto, retorna.
     if (whatsappClients[userId] && whatsappClients[userId].getState() !== 'STOPPED') {
         return whatsappClients[userId];
     }
@@ -51,7 +52,6 @@ function getOrCreateWhatsappClient(userId) {
     console.log(`[Sistema] Criando novo cliente de WhatsApp para: ${userId}`);
     const client = new Client({ 
         authStrategy: new LocalAuth({ clientId: userId }), 
-        // Args de Puppeteer para Render/produção
         puppeteer: { 
             headless: true, 
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-mhtml-generation'] 
@@ -60,17 +60,15 @@ function getOrCreateWhatsappClient(userId) {
 
     // Eventos
     client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
-    
     client.on('ready', () => {
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
-    
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
     });
     
-    // === LÓGICA DE MENSAGENS E IA (CORREÇÃO DE ESCOPO) ===
+    // === LÓGICA DE MENSAGENS E IA (AGORA DENTRO DO ESCOPO DA FUNÇÃO getOrCreateWhatsappClient) ===
     client.on('message', async (message) => {
         const userContact = message.from;
         console.log(`[WhatsApp - ${userId}] Mensagem de ${userContact}: ${message.body}`);
@@ -157,7 +155,8 @@ app.get('/status', async (req, res) => {
     
     if (client) {
         try {
-            const state = await client.getState();
+            // CORRIGIDO: Checa se client.getState() está acessível
+            const state = client.pupPage ? await client.getState() : 'OPENING';
             const isConnected = state === 'CONNECTED';
             
             return res.status(200).json({ 
@@ -184,7 +183,8 @@ app.post('/send', async (req, res) => {
     
     const client = whatsappClients[userId];
     
-    if (!client || (await client.getState()) !== 'CONNECTED') {
+    // Verificação de conexão mais segura
+    if (!client || client.getState() !== 'CONNECTED') {
         return res.status(400).json({ ok: false, error: 'O cliente WhatsApp não está conectado. Verifique o status.' });
     }
 
