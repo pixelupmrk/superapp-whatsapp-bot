@@ -7,16 +7,17 @@ const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 // --- Configuração do Firebase Admin ---
+let db;
 try {
     // Certifique-se de que FIREBASE_SERVICE_ACCOUNT está configurado no Render
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     initializeApp({ credential: cert(serviceAccount) });
+    db = getFirestore();
     console.log("[Firebase] Conectado ao Firebase Admin!");
 } catch (error) {
     console.error("[Firebase] ERRO: Verifique a variável de ambiente FIREBASE_SERVICE_ACCOUNT.", error);
-    // Se a inicialização falhar, o bot não pode se conectar ao Firestore, mas o servidor Express deve continuar rodando.
+    // Permite que o servidor Express inicie mesmo se o Firebase Admin falhar.
 }
-const db = getFirestore();
 
 // --- Configuração da IA ---
 const apiKey = process.env.GEMINI_API_KEY;
@@ -34,7 +35,7 @@ const port = process.env.PORT || 10000;
 const whatsappClients = {};
 const frontendConnections = {};
 
-// --- Funções de Comunicação ---
+// --- Funções de Comunicação e Criação do Cliente ---
 
 function sendEventToUser(userId, data) {
     if (frontendConnections[userId]) {
@@ -42,7 +43,7 @@ function sendEventToUser(userId, data) {
     }
 }
 
-// Obtém o cliente de WhatsApp, criando-o se não existir
+// Obtém o cliente de WhatsApp, criando-o e inicializando-o se não existir
 function getOrCreateWhatsappClient(userId) {
     if (whatsappClients[userId] && whatsappClients[userId].getState() !== 'STOPPED') {
         return whatsappClients[userId];
@@ -66,20 +67,79 @@ function getOrCreateWhatsappClient(userId) {
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
-        // Não deletamos o cliente imediatamente para permitir a reconexão
     });
+    
+    // === LÓGICA DE MENSAGENS E IA (CORREÇÃO DE ESCOPO) ===
+    client.on('message', async (message) => {
+        const userContact = message.from;
+        console.log(`[WhatsApp - ${userId}] Mensagem de ${userContact}: ${message.body}`);
+        if (message.isStatus || message.from.includes('@g.us') || message.fromMe) return;
 
-    client.initialize().catch(err => console.error(`[${userId}] Falha ao inicializar o cliente W.A:`, err));
+        try {
+            const userDocRef = db.collection('userData').doc(userId);
+            const userDoc = await userDocRef.get();
+            if (!userDoc.exists) {
+                console.log(`[Sistema - ${userId}] Documento do usuário não encontrado.`);
+                return;
+            }
+            
+            let userData = userDoc.data();
+            let leads = userData.leads || [];
+            let currentLead = leads.find(lead => lead.whatsapp === userContact);
+            let leadId;
+
+            // Lógica para não responder se o bot estiver desativado para este lead
+            if (currentLead && currentLead.botActive === false) {
+                console.log(`[Bot - ${userId}] Bot desativado para o lead ${currentLead.nome}. Ignorando mensagem.`);
+                return;
+            }
+
+            if (!currentLead) {
+                console.log(`[CRM - ${userId}] Novo contato!`);
+                
+                // Puxa as instruções de IA salvas pelo usuário
+                const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+                const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${message.body}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
+                
+                const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
+                
+                const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
+                const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true }; 
+                leadId = nextId;
+                
+                // Salva o novo lead no array do usuário no Firestore
+                await userDocRef.update({ leads: FieldValue.arrayUnion(newLead) });
+                console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado!`);
+                currentLead = newLead; 
+            } else {
+                leadId = currentLead.id;
+            }
+
+            // Salva a mensagem do usuário no histórico do lead
+            await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
+                      .collection('messages').add({ text: message.body, sender: 'lead', timestamp: new Date() });
+
+            // Gera resposta da IA
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${message.body}"`;
+            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+            
+            await message.reply(aiResponse);
+
+            // Salva a resposta da IA no histórico do lead
+            await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
+                      .collection('messages').add({ text: aiResponse, sender: 'operator', timestamp: new Date() });
+
+        } catch (error) {
+            console.error(`[Sistema - ${userId}] Erro no processamento da mensagem:`, error);
+        }
+    });
+    // === FIM DA LÓGICA DE MENSAGENS E IA ===
+
+    client.initialize().catch(err => console.error(`[${userId}] Falha ao inicializar:`, err));
     whatsappClients[userId] = client;
     return client;
 }
-
-// --- Lógica de Mensagens (IA) ---
-
-client.on('message', async (message) => {
-    // [Lógica completa de mensagens omitida por brevidade, mas deve estar no seu bot no Render]
-    // ...
-});
 
 // --- Endpoints para o Frontend (Super App) ---
 
@@ -87,27 +147,28 @@ client.on('message', async (message) => {
 app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) {
-        // RESPOSTA CORRETA EM JSON
         return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
     }
     
     const client = whatsappClients[userId];
     
     if (client) {
-        const state = await client.getState();
-        const isConnected = state === 'CONNECTED';
-        
-        // RESPOSTA CORRETA EM JSON
-        return res.status(200).json({ 
-            connected: isConnected, 
-            user: isConnected ? client.info.pushname : 'Dispositivo',
-            status: isConnected ? 'CONNECTED' : state
-        });
+        try {
+            const state = await client.getState();
+            const isConnected = state === 'CONNECTED';
+            
+            return res.status(200).json({ 
+                connected: isConnected, 
+                user: isConnected ? client.info.pushname : 'Dispositivo',
+                status: isConnected ? 'CONNECTED' : state
+            });
+        } catch (e) {
+            // Se getState falhar (cliente ainda não inicializado ou erro)
+            return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline.' });
+        }
     } else {
         // Força a criação/inicialização do cliente para que ele comece a gerar o QR/Status
         getOrCreateWhatsappClient(userId); 
-        
-        // RESPOSTA CORRETA EM JSON
         return res.status(200).json({ connected: false, status: 'Aguardando inicialização do cliente...' });
     }
 });
@@ -138,7 +199,6 @@ app.post('/send', async (req, res) => {
 app.get('/events', (req, res) => {
     const userId = req.query.userId;
     if (!userId) {
-        // RESPOSTA CORRETA EM JSON
         return res.status(400).json({ error: 'userId é obrigatório' });
     }
     
@@ -154,9 +214,9 @@ app.get('/events', (req, res) => {
     req.on('close', () => delete frontendConnections[userId]);
 });
 
-// Endpoint de teste (Se o Render retornar HTML no /status, ele provavelmente está enviando a resposta padrão, o que é um erro)
+// Endpoint de boas-vindas (para evitar o erro HTML no /status)
 app.get('/', (req, res) => {
-    res.status(200).send("Seu serviço está rodando no ar (versão corrigida).");
+    res.status(200).json({ status: "Bot está ativo. Use /status ou /events." });
 });
 
 app.listen(port, () => console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`));
