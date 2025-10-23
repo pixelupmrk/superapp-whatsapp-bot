@@ -33,6 +33,7 @@ app.use(express.json());
 const port = process.env.PORT || 10000;
 const whatsappClients = {};
 const frontendConnections = {};
+const qrCodeDataStore = {}; // NOVO: Armazenamento temporário do último QR Code gerado
 
 // --- Funções de Comunicação e Criação do Cliente ---
 
@@ -60,8 +61,12 @@ function getOrCreateWhatsappClient(userId) {
     });
 
     // Eventos
-    client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
+    client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => {
+        qrCodeDataStore[userId] = url; // SALVA A URL DO QR CODE
+        sendEventToUser(userId, { type: 'qr', data: url });
+    }));
     client.on('ready', () => {
+        delete qrCodeDataStore[userId]; // Limpa o QR Code quando conectado
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
     client.on('disconnected', (reason) => {
@@ -152,8 +157,7 @@ app.get('/status', async (req, res) => {
     
     if (client) {
         try {
-            // CORREÇÃO CRÍTICA FINAL: Se client.pupPage for null/undefined, ele ainda não está pronto. 
-            // NUNCA Chame getState() sem verificar client.pupPage primeiro.
+            // Se client.pupPage for null/undefined, ele ainda não está pronto. 
             if (!client.pupPage) {
                 return res.status(200).json({ connected: false, status: 'OPENING', detail: 'Aguardando inicialização do navegador...' });
             }
@@ -167,7 +171,7 @@ app.get('/status', async (req, res) => {
                 status: isConnected ? 'CONNECTED' : state
             });
         } catch (e) {
-            // Isso deve ser o último recurso para falhas inesperadas
+            // Se getState ou info falhar (erro no Puppeteer/Estado)
             return res.status(200).json({ connected: false, status: 'Cliente offline (Erro Interno).' });
         }
     } else {
@@ -215,6 +219,44 @@ app.get('/events', (req, res) => {
     getOrCreateWhatsappClient(userId);
 
     req.on('close', () => delete frontendConnections[userId]);
+});
+
+// NOVO ENDPOINT: Rota para exibir o QR Code para teste manual
+app.get('/qrcode-test', async (req, res) => {
+    const userId = req.query.userId;
+    if (!userId) {
+        return res.status(400).send("<html><body><h2>Erro</h2><p>Parâmetro <code>userId</code> é obrigatório. Use: <code>/qrcode-test?userId=SEU_ID</code></p></body></html>");
+    }
+
+    getOrCreateWhatsappClient(userId); // Garante que o cliente esteja inicializando e tentando gerar o QR Code
+
+    // Espera um pouco para o evento de QR Code ser disparado (assíncrono)
+    await new Promise(resolve => setTimeout(resolve, 5000)); 
+
+    const qrUrl = qrCodeDataStore[userId];
+
+    if (qrUrl) {
+        // Exibe o QR Code como uma imagem no navegador
+        return res.status(200).send(`
+            <html>
+                <body style="background-color: #1a1a2e; color: #cdd6f4; text-align: center; padding: 50px;">
+                    <h2>Escaneie o QR Code para Conectar o Bot!</h2>
+                    <img src="${qrUrl}" alt="QR Code do WhatsApp" style="border: 5px solid #00f7ff; max-width: 300px;"/>
+                    <p style="margin-top: 20px;">Este QR Code é válido por pouco tempo. Escaneie agora.</p>
+                </body>
+            </html>
+        `);
+    } else {
+        // Verifica o status do cliente para dar feedback
+        const client = whatsappClients[userId];
+        const state = client ? (client.pupPage ? await client.getState() : 'INICIALIZANDO') : 'NÃO ENCONTRADO';
+
+        if (state === 'CONNECTED') {
+             return res.status(200).send(`<html><body style="background-color: #1a1a2e; color: #25D366; text-align: center; padding: 50px;"><h2>BOT JÁ CONECTADO!</h2><p>Usuário: ${client.info.pushname}</p><p>Estado: ${state}</p></body></html>`);
+        } else {
+             return res.status(200).send(`<html><body style="background-color: #1a1a2e; color: #ffc107; text-align: center; padding: 50px;"><h2>Aguarde</h2><p>Estado atual: ${state}</p><p>Aguarde e recarregue a página em alguns segundos. O Render Free está iniciando o navegador.</p></body></html>`);
+        }
+    }
 });
 
 // Endpoint de boas-vindas para garantir que o /status não retorne HTML
