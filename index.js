@@ -44,7 +44,7 @@ function sendEventToUser(userId, data) {
 
 // Obtém o cliente de WhatsApp, criando-o e inicializando-o se não existir
 function getOrCreateWhatsappClient(userId) {
-    // CORRIGIDO: Se o cliente já existe e está pronto, retorna.
+    // Se o cliente já existe e está pronto, retorna.
     if (whatsappClients[userId] && whatsappClients[userId].getState() !== 'STOPPED') {
         return whatsappClients[userId];
     }
@@ -61,12 +61,9 @@ function getOrCreateWhatsappClient(userId) {
 
     // Eventos
     client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
-    
     client.on('ready', () => {
-        // Envia o status de conexão para o frontend
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
-    
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
@@ -74,8 +71,6 @@ function getOrCreateWhatsappClient(userId) {
     
     // === LÓGICA DE MENSAGENS E IA ===
     client.on('message', async (message) => {
-        // Lógica de processamento de mensagem...
-        // Mantenha essa lógica aqui, pois ela está no escopo correto.
         const userContact = message.from;
         console.log(`[WhatsApp - ${userId}] Mensagem de ${userContact}: ${message.body}`);
         if (message.isStatus || message.from.includes('@g.us') || message.fromMe) return;
@@ -157,8 +152,13 @@ app.get('/status', async (req, res) => {
     
     if (client) {
         try {
-            // CORREÇÃO CRÍTICA: Checa se pupPage existe antes de chamar getState
-            const state = client.pupPage ? await client.getState() : 'OPENING';
+            // CORREÇÃO CRÍTICA FINAL: Usamos um retorno seguro para evitar o TypeError
+            // Verifica se pupPage existe antes de chamar getState
+            if (!client.pupPage) {
+                return res.status(200).json({ connected: false, status: 'OPENING', detail: 'Aguardando inicialização do navegador...' });
+            }
+            
+            const state = await client.getState();
             const isConnected = state === 'CONNECTED';
             
             return res.status(200).json({ 
@@ -168,7 +168,7 @@ app.get('/status', async (req, res) => {
             });
         } catch (e) {
             // Se getState ou info falhar (erro no Puppeteer/Estado)
-            return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline (Erro Interno).' });
+            return res.status(200).json({ connected: false, status: 'Cliente offline (Erro Interno).' });
         }
     } else {
         // Força a criação/inicialização do cliente para que ele comece a gerar o QR/Status
