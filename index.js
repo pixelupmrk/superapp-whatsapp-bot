@@ -9,6 +9,7 @@ const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 // --- Configuração do Firebase Admin ---
 let db;
 try {
+    // Certifique-se de que FIREBASE_SERVICE_ACCOUNT está configurado no Render
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     initializeApp({ credential: cert(serviceAccount) });
     db = getFirestore();
@@ -25,6 +26,7 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // --- Configuração do Servidor Express ---
 const app = express();
+// Configura CORS para permitir acesso de qualquer origem (NECESSÁRIO para o Vercel)
 app.use(cors({ origin: true })); 
 app.use(express.json());
 
@@ -49,17 +51,20 @@ function getOrCreateWhatsappClient(userId) {
     console.log(`[Sistema] Criando novo cliente de WhatsApp para: ${userId}`);
     const client = new Client({ 
         authStrategy: new LocalAuth({ clientId: userId }), 
+        // Args de Puppeteer para Render/produção
         puppeteer: { 
             headless: true, 
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-mhtml-generation'] 
         } 
     });
 
     // Eventos
     client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
+    
     client.on('ready', () => {
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
+    
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
@@ -72,6 +77,11 @@ function getOrCreateWhatsappClient(userId) {
         if (message.isStatus || message.from.includes('@g.us') || message.fromMe) return;
 
         try {
+            if (!db) {
+                console.error(`[Sistema - ${userId}] Firestore não inicializado. Não é possível processar a mensagem.`);
+                return;
+            }
+
             const userDocRef = db.collection('userData').doc(userId);
             const userDoc = await userDocRef.get();
             if (!userDoc.exists) {
@@ -130,7 +140,7 @@ function getOrCreateWhatsappClient(userId) {
     });
     // === FIM DA LÓGICA DE MENSAGENS E IA ===
 
-    client.initialize().catch(err => console.error(`[${userId}] Falha ao inicializar:`, err));
+    client.initialize().catch(err => console.error(`[${userId}] Falha ao inicializar o cliente:`, err));
     whatsappClients[userId] = client;
     return client;
 }
@@ -156,6 +166,7 @@ app.get('/status', async (req, res) => {
                 status: isConnected ? 'CONNECTED' : state
             });
         } catch (e) {
+            // Se getState falhar (cliente ainda não inicializado ou erro)
             return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline.' });
         }
     } else {
@@ -204,7 +215,7 @@ app.get('/events', (req, res) => {
     req.on('close', () => delete frontendConnections[userId]);
 });
 
-// Endpoint de boas-vindas para evitar erros 404/HTML no Render
+// Endpoint de boas-vindas para garantir que o /status não retorne HTML
 app.get('/', (req, res) => {
     res.status(200).json({ status: "Bot está ativo. Use /status ou /events." });
 });
