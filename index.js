@@ -52,6 +52,7 @@ function getOrCreateWhatsappClient(userId) {
     console.log(`[Sistema] Criando novo cliente de WhatsApp para: ${userId}`);
     const client = new Client({ 
         authStrategy: new LocalAuth({ clientId: userId }), 
+        // Args de Puppeteer para Render/produção - Crucial para resolver erros de ambiente
         puppeteer: { 
             headless: true, 
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-mhtml-generation'] 
@@ -60,16 +61,21 @@ function getOrCreateWhatsappClient(userId) {
 
     // Eventos
     client.on('qr', (qr) => qrcode.toDataURL(qr, (err, url) => sendEventToUser(userId, { type: 'qr', data: url })));
+    
     client.on('ready', () => {
+        // Envia o status de conexão para o frontend
         sendEventToUser(userId, { type: 'status', connected: true, user: client.info.pushname || client.info.wid.user });
     });
+    
     client.on('disconnected', (reason) => {
         console.log(`[WhatsApp - ${userId}] Cliente desconectado:`, reason);
         sendEventToUser(userId, { type: 'status', connected: false, status: 'disconnected' });
     });
     
-    // === LÓGICA DE MENSAGENS E IA (AGORA DENTRO DO ESCOPO DA FUNÇÃO getOrCreateWhatsappClient) ===
+    // === LÓGICA DE MENSAGENS E IA ===
     client.on('message', async (message) => {
+        // Lógica de processamento de mensagem...
+        // Mantenha essa lógica aqui, pois ela está no escopo correto.
         const userContact = message.from;
         console.log(`[WhatsApp - ${userId}] Mensagem de ${userContact}: ${message.body}`);
         if (message.isStatus || message.from.includes('@g.us') || message.fromMe) return;
@@ -92,7 +98,6 @@ function getOrCreateWhatsappClient(userId) {
             let currentLead = leads.find(lead => lead.whatsapp === userContact);
             let leadId;
 
-            // Lógica para não responder se o bot estiver desativado para este lead
             if (currentLead && currentLead.botActive === false) {
                 console.log(`[Bot - ${userId}] Bot desativado para o lead ${currentLead.nome}. Ignorando mensagem.`);
                 return;
@@ -117,18 +122,15 @@ function getOrCreateWhatsappClient(userId) {
                 leadId = currentLead.id;
             }
 
-            // Salva a mensagem do usuário no histórico do lead
             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
                       .collection('messages').add({ text: message.body, sender: 'lead', timestamp: new Date() });
 
-            // Gera resposta da IA
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${message.body}"`;
             const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
             
             await message.reply(aiResponse);
 
-            // Salva a resposta da IA no histórico do lead
             await db.collection('userData').doc(userId).collection('leads').doc(String(leadId))
                       .collection('messages').add({ text: aiResponse, sender: 'operator', timestamp: new Date() });
 
@@ -155,7 +157,7 @@ app.get('/status', async (req, res) => {
     
     if (client) {
         try {
-            // CORRIGIDO: Checa se client.getState() está acessível
+            // CORREÇÃO CRÍTICA: Checa se pupPage existe antes de chamar getState
             const state = client.pupPage ? await client.getState() : 'OPENING';
             const isConnected = state === 'CONNECTED';
             
@@ -165,8 +167,8 @@ app.get('/status', async (req, res) => {
                 status: isConnected ? 'CONNECTED' : state
             });
         } catch (e) {
-            // Se getState falhar (cliente ainda não inicializado ou erro)
-            return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline.' });
+            // Se getState ou info falhar (erro no Puppeteer/Estado)
+            return res.status(200).json({ connected: false, status: 'Cliente inicializando ou offline (Erro Interno).' });
         }
     } else {
         // Força a criação/inicialização do cliente para que ele comece a gerar o QR/Status
@@ -184,7 +186,7 @@ app.post('/send', async (req, res) => {
     const client = whatsappClients[userId];
     
     // Verificação de conexão mais segura
-    if (!client || client.getState() !== 'CONNECTED') {
+    if (!client || (client.pupPage && await client.getState() !== 'CONNECTED')) {
         return res.status(400).json({ ok: false, error: 'O cliente WhatsApp não está conectado. Verifique o status.' });
     }
 
