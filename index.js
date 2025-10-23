@@ -152,8 +152,8 @@ app.get('/status', async (req, res) => {
     
     if (client) {
         try {
-            // CORREÇÃO CRÍTICA FINAL: Usamos um retorno seguro para evitar o TypeError
-            // Verifica se pupPage existe antes de chamar getState
+            // CORREÇÃO CRÍTICA FINAL: Se client.pupPage for null/undefined, ele ainda não está pronto. 
+            // NUNCA Chame getState() sem verificar client.pupPage primeiro.
             if (!client.pupPage) {
                 return res.status(200).json({ connected: false, status: 'OPENING', detail: 'Aguardando inicialização do navegador...' });
             }
@@ -167,7 +167,7 @@ app.get('/status', async (req, res) => {
                 status: isConnected ? 'CONNECTED' : state
             });
         } catch (e) {
-            // Se getState ou info falhar (erro no Puppeteer/Estado)
+            // Isso deve ser o último recurso para falhas inesperadas
             return res.status(200).json({ connected: false, status: 'Cliente offline (Erro Interno).' });
         }
     } else {
@@ -186,7 +186,7 @@ app.post('/send', async (req, res) => {
     const client = whatsappClients[userId];
     
     // Verificação de conexão mais segura
-    if (!client || (client.pupPage && await client.getState() !== 'CONNECTED')) {
+    if (!client || client.getState() !== 'CONNECTED') {
         return res.status(400).json({ ok: false, error: 'O cliente WhatsApp não está conectado. Verifique o status.' });
     }
 
