@@ -3,7 +3,7 @@ const cors = require('cors');
 const qrcode = require('qrcode');
 const { 
     default: makeWASocket, 
-    useMultiFileAuthState, 
+    useMultiFileAuthState, // AINDA USAMOS PARA TESTE
     makeInMemoryStore, 
     DisconnectReason 
 } = require('@whiskeysockets/baileys');
@@ -49,14 +49,14 @@ function sendEventToUser(userId, data) {
 async function getOrCreateWhatsappClient(userId) {
     let sock = whatsappClients[userId];
     
-    // 1. Checa se já existe e está conectado/conectando
     if (sock && sock.user) {
         return sock;
     }
     
     console.log(`[Sistema] Inicializando cliente Baileys para: ${userId}`);
     
-    // 2. Cria o estado de autenticação (salva no disco/Render para persistência)
+    // --- IMPORTANTE: TENTA SALVAR A SESSÃO NO DISCO TEMPORÁRIO ---
+    // Em produção, isso seria substituído por um banco de dados (Firestore)
     const { state, saveCreds } = await useMultiFileAuthState(`baileys_auth_${userId}`);
 
     sock = makeWASocket({
@@ -68,21 +68,21 @@ async function getOrCreateWhatsappClient(userId) {
 
     store.bind(sock.ev);
     
-    // 3. Funções de IA/Mensagens
+    // --- Funções de Mensagens ---
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const message = messages[0];
-        if (!message.key.fromMe && message.key.remoteJid !== 'status@broadcast') {
+        if (!message.key.fromMe && message.key.remoteJid !== 'status@broadcast' && message.remoteJid !== 'status@broadcast') {
             await handleNewMessage(message, userId);
         }
     });
 
-    // 4. Lógica de Conexão e QR Code
+    // --- Lógica de Conexão e QR Code ---
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
             qrcode.toDataURL(qr, (err, url) => {
-                qrCodeDataStore[userId] = url; // Salva o QR Code
+                qrCodeDataStore[userId] = url; 
                 sendEventToUser(userId, { type: 'qr', data: url });
             });
         }
@@ -90,12 +90,9 @@ async function getOrCreateWhatsappClient(userId) {
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut);
             console.log(`[Baileys - ${userId}] Conexão fechada. Tentando reconectar: ${shouldReconnect}`);
+            sendEventToUser(userId, { type: 'status', connected: false, status: 'Fechado/Desconectado' });
             if (shouldReconnect) {
-                // Tentativa de reconexão automática
                 getOrCreateWhatsappClient(userId); 
-            } else {
-                // Sessão encerrada (necessita novo QR Code)
-                sendEventToUser(userId, { type: 'status', connected: false, status: 'LOGGED_OUT' });
             }
         } else if (connection === 'open') {
             console.log(`[Baileys - ${userId}] Conectado!`);
@@ -120,7 +117,7 @@ async function handleNewMessage(message, userId) {
     const userContact = message.key.remoteJid;
     const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
     
-    if (!messageText || messageText.startsWith('//')) return; // Ignora mensagens vazias ou de sistema
+    if (!messageText || userContact === 'status@broadcast') return;
 
     try {
         const userDocRef = db.collection('userData').doc(userId);
@@ -133,14 +130,41 @@ async function handleNewMessage(message, userId) {
         const normalizedContact = userContact.split('@')[0];
         let currentLead = leads.find(lead => lead.whatsapp.includes(normalizedContact));
 
-        // [Lógica de Bot Active, Criação de Lead, Salvamento no Firestore - Mesma Lógica de Negócio]
-        // Esta parte do código (que já estava no seu wweb.js) é a mais complexa e deve ser reescrita para Baileys
-        // e é a parte que você deve garantir que esteja 100% no seu index.js
-        // ... (Para brevidade, assumimos que a lógica de IA e CRM será portada corretamente)
+        // Lógica para não responder se o bot estiver desativado para este lead
+        if (currentLead && currentLead.botActive === false) {
+            console.log(`[Bot - ${userId}] Bot desativado para o lead ${currentLead.nome}. Ignorando mensagem.`);
+            return;
+        }
+
+        // === CRIAÇÃO DE NOVO LEAD E ATENDIMENTO ===
+        if (!currentLead) {
+            console.log(`[CRM - ${userId}] Novo contato!`);
+            
+            // 1. Lógica da IA para extrair nome
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
+            const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
+            
+            // 2. Cria o novo lead
+            const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
+            const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true }; 
+            
+            // 3. SALVA O NOVO LEAD NO FIREBASE
+            await userDocRef.update({ leads: FieldValue.arrayUnion(newLead) });
+            currentLead = newLead; 
+            console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado no Firestore!`);
+        }
+
+        // 4. Salva a mensagem do usuário no histórico do lead (Omitido por brevidade)
+        // ...
+
+        // 5. Gera resposta da IA
+        const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+        const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
+        const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
         
-        // Simulação da Lógica de Resposta da IA (para teste de conectividade)
-        const aiResponse = "🤖 Bot Baileys: Recebi sua mensagem com sucesso. Agora estou no Baileys!";
-        await whatsappClients[userId].sendMessage(userContact, { text: aiResponse });
+        // 6. Envia a resposta pelo WhatsApp
+        await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
 
     } catch (error) {
         console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
@@ -149,17 +173,14 @@ async function handleNewMessage(message, userId) {
 
 // --- Endpoints para o Frontend (Super App) ---
 
-// Status do Bot
 app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
     
     const sock = await getOrCreateWhatsappClient(userId);
 
-    // Checa o status da conexão Baileys
     const isConnected = (sock.user && sock.user.id);
 
-    // Se houver QR Code no armazenamento, envia o QR
     if (!isConnected && qrCodeDataStore[userId]) {
         return res.status(200).json({ 
             connected: false, 
@@ -175,7 +196,6 @@ app.get('/status', async (req, res) => {
     });
 });
 
-// Envio de Mensagem
 app.post('/send', async (req, res) => {
     const { to, text, userId } = req.body;
     if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios.' });
@@ -195,7 +215,7 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// Eventos SSE (Para QR Code e Status em tempo real)
+
 app.get('/events', (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
@@ -206,7 +226,7 @@ app.get('/events', (req, res) => {
     res.flushHeaders();
     frontendConnections[userId] = { res };
 
-    getOrCreateWhatsappClient(userId); // Inicia o bot, se necessário
+    getOrCreateWhatsappClient(userId);
 
     req.on('close', () => delete frontendConnections[userId]);
 });
