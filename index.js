@@ -129,15 +129,11 @@ async function handleNewMessage(message, userId) {
         // Normaliza o número para o formato Baileys (user@s.whatsapp.net)
         const normalizedContact = userContact.split('@')[0];
         let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
+        let isNewLead = false;
 
-        // Lógica para não responder se o bot estiver desativado para este lead
-        if (currentLead && currentLead.botActive === false) {
-            console.log(`[Bot - ${userId}] Bot desativado para o lead ${currentLead.nome}. Ignorando mensagem.`);
-            return;
-        }
-
-        // === CRIAÇÃO DE NOVO LEAD E ATENDIMENTO ===
+        // === CRIAÇÃO DE NOVO LEAD ===
         if (!currentLead) {
+            isNewLead = true;
             console.log(`[CRM - ${userId}] Novo contato!`);
             
             // 1. Lógica da IA para extrair nome
@@ -147,46 +143,60 @@ async function handleNewMessage(message, userId) {
             
             // 2. Cria o novo lead
             const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
-            const newLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true }; 
+            currentLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true, unreadCount: 0 }; 
             
-            // 3. SALVA O NOVO LEAD NO FIREBASE
-            await userDocRef.update({ leads: FieldValue.arrayUnion(newLead) });
-            currentLead = newLead; 
-            console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado no Firestore!`);
+            // 3. Adiciona o novo lead localmente para processamento
+            leads.push(currentLead);
         }
         
-        // --- LOGIC CRÍTICA DE SALVAMENTO NO FIRESTORE (RESOLVE SINCRONIA) ---
+        // --- INÍCIO DA LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
-
-        // 4. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        
+        // 1. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user') - SEMPRE SALVA
         await chatRef.add({
             role: "user",
             parts: [{text: messageText}],
             timestamp: FieldValue.serverTimestamp(),
         });
         
-        // 5. Gera resposta da IA
-        const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
-        const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
-        const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+        // 2. INCREMENTA O CONTADOR (Bolinha de Notificação) - SEMPRE INCREMENTA
+        const leadIndex = leads.findIndex(l => l.id === currentLead.id);
+        if (leadIndex !== -1) {
+             leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
+        }
+
+        // 3. ATUALIZA O ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
+        await userDocRef.update({ leads: leads });
         
-        // 6. SALVA A RESPOSTA DA IA (role: 'model')
-        await chatRef.add({
-            role: "model",
-            parts: [{text: aiResponse}],
-            timestamp: FieldValue.serverTimestamp(),
-        });
+        // 4. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador)
+        sendEventToUser(userId, { type: 'message', from: userContact });
 
-        // 7. Envia a resposta pelo WhatsApp (só depois de salvar a conversa)
-        await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
+        // --- LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        if (currentLead.botActive === true) {
+            
+            console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
+            
+            // 5. Gera resposta da IA
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
+            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+            
+            // 6. SALVA A RESPOSTA DA IA (role: 'model')
+            await chatRef.add({
+                role: "model",
+                parts: [{text: aiResponse}],
+                timestamp: FieldValue.serverTimestamp(),
+            });
 
-        // 8. Envia um evento de atualização para o Front-end
-        sendEventToUser(userId, { type: 'message', from: userContact, text: aiResponse });
+            // 7. Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
+            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
+
+        } else {
+            console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
+        }
 
     } catch (error) {
         console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
-        // Tenta enviar uma mensagem de erro de volta para o cliente, se possível
-        // Omitido para simplificação, mas aqui iria uma lógica de fallback.
     }
 }
 
@@ -217,7 +227,7 @@ app.get('/status', async (req, res) => {
 
 app.post('/send', async (req, res) => {
     const { to, text, userId } = req.body;
-    if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios.' });
+    if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios' });
     
     const sock = whatsappClients[userId];
     if (!sock || !sock.user) {
@@ -226,6 +236,8 @@ app.post('/send', async (req, res) => {
 
     try {
         const normalizedTo = to.includes('@s.whatsapp.net') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+        // OBS: O salvamento no Firestore para a mensagem do operador foi movido para o Front-end
+        // (no script.js) para garantir a atualização imediata da tela.
         await sock.sendMessage(normalizedTo, { text: text });
         return res.status(200).json({ ok: true, message: 'Mensagem enviada com sucesso!' });
     } catch (error) {
