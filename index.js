@@ -128,7 +128,7 @@ async function handleNewMessage(message, userId) {
         let leads = userData.leads || [];
         // Normaliza o número para o formato Baileys (user@s.whatsapp.net)
         const normalizedContact = userContact.split('@')[0];
-        let currentLead = leads.find(lead => lead.whatsapp.includes(normalizedContact));
+        let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
 
         // Lógica para não responder se o bot estiver desativado para este lead
         if (currentLead && currentLead.botActive === false) {
@@ -154,20 +154,39 @@ async function handleNewMessage(message, userId) {
             currentLead = newLead; 
             console.log(`[CRM - ${userId}] Novo lead "${leadName}" criado no Firestore!`);
         }
+        
+        // --- LOGIC CRÍTICA DE SALVAMENTO NO FIRESTORE (RESOLVE SINCRONIA) ---
+        const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
 
-        // 4. Salva a mensagem do usuário no histórico do lead (Omitido por brevidade)
-        // ...
-
+        // 4. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        await chatRef.add({
+            role: "user",
+            parts: [{text: messageText}],
+            timestamp: FieldValue.serverTimestamp(),
+        });
+        
         // 5. Gera resposta da IA
         const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
         const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
         const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
         
-        // 6. Envia a resposta pelo WhatsApp
+        // 6. SALVA A RESPOSTA DA IA (role: 'model')
+        await chatRef.add({
+            role: "model",
+            parts: [{text: aiResponse}],
+            timestamp: FieldValue.serverTimestamp(),
+        });
+
+        // 7. Envia a resposta pelo WhatsApp (só depois de salvar a conversa)
         await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
+
+        // 8. Envia um evento de atualização para o Front-end
+        sendEventToUser(userId, { type: 'message', from: userContact, text: aiResponse });
 
     } catch (error) {
         console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
+        // Tenta enviar uma mensagem de erro de volta para o cliente, se possível
+        // Omitido para simplificação, mas aqui iria uma lógica de fallback.
     }
 }
 
