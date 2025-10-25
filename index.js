@@ -27,7 +27,8 @@ try {
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+// Ajuste: Modelo agora é chamado de forma simples para generateContent
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 
 // --- Configuração do Servidor Express ---
 const app = express();
@@ -126,11 +127,12 @@ async function handleNewMessage(message, userId) {
         let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
         let isNewLead = false;
 
-        // === CRIAÇÃO DE NOVO LEAD ===
+        // === 1. CRIAÇÃO DE NOVO LEAD ===
         if (!currentLead) {
             isNewLead = true;
             console.log(`[CRM - ${userId}] Novo contato!`);
             
+            // Lógica da IA para extrair nome 
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
             const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
@@ -141,102 +143,62 @@ async function handleNewMessage(message, userId) {
             leads.push(currentLead);
         }
         
-        // --- INÍCIO DA LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
+        // --- 2. LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
-        // 1. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
         await chatRef.add({
             role: "user",
             parts: [{text: messageText}],
             timestamp: FieldValue.serverTimestamp(),
         });
         
-        // 2. INCREMENTA O CONTADOR (Bolinha de Notificação)
+        // INCREMENTA O CONTADOR (Bolinha de Notificação)
         const leadIndex = leads.findIndex(l => l.id === currentLead.id);
         if (leadIndex !== -1) {
              leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        // --- LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        let aiResponseText = ""; // Variável para armazenar a resposta final
+        
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            // NOVO: ESTRUTURAÇÃO DA RESPOSTA DA IA PARA POSSÍVEL AGENDAMENTO
+            // NOVO: Chamada simples e robusta para o Gemini
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo e focado em triagem e agendamento.";
+            const fullPrompt = `${botInstructions}\n\nVocê está conversando com um cliente chamado ${currentLead.nome}. Mantenha a conversa natural, use negrito e emojis para destacar pontos-chave e tente fechar um agendamento ou follow-up.\n\nMensagem do cliente: "${messageText}"`;
             
-            const fullPrompt = `${botInstructions}\n\nAnalise a mensagem do cliente: "${messageText}". Responda de forma envolvente, mas seu foco principal é extrair a DATA e HORA de um possível agendamento ou follow-up.
-
-            Se você identificar no chat uma intenção clara de agendamento (Ex: "amanhã às 14h", "quarta-feira 10h"), inclua a instrução de agendamento no seu comando de saída (JSON).
-
-            Instrução Final: O resultado deve ser um JSON com a chave 'response_text' (sua resposta de chat) e, *opcionalmente*, a chave 'schedule_info' se houver dados de agendamento. Se não houver agendamento, retorne apenas a chave 'response_text'.`;
-
-            const aiResponseResult = await model.generateContent({
-                contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: "object",
-                        properties: {
-                            response_text: {
-                                type: "string",
-                                description: "A resposta amigável e persuasiva para o cliente no WhatsApp (Obrigatório)."
-                            },
-                            scheduledDate: {
-                                type: "string",
-                                description: "A data do agendamento encontrada (Ex: '2025-10-26'). Se não houver, omita."
-                            },
-                            scheduledTime: {
-                                type: "string",
-                                description: "A hora do agendamento encontrada (Ex: '14:30'). Se não houver, omita."
-                            },
-                            reminderType: {
-                                type: "string",
-                                description: "O tipo de compromisso (Ex: 'followup' ou 'meeting'). Se agendado, use 'followup'."
-                            }
-                        },
-                        required: ["response_text"]
-                    }
-                }
-            });
+            const aiResponseResult = await model.generateContent(fullPrompt);
+            aiResponseText = aiResponseResult.text;
             
-            const aiResponseJson = JSON.parse(aiResponseResult.text);
-            const aiResponseText = aiResponseJson.response_text;
-            
-            // 4. ATUALIZAÇÃO DO LEAD COM A AGENDA (SE HOUVER)
-            if (aiResponseJson.scheduledDate && aiResponseJson.scheduledTime) {
-                
-                // Atualiza o lead localmente
-                leads[leadIndex].scheduledDate = aiResponseJson.scheduledDate;
-                leads[leadIndex].scheduledTime = aiResponseJson.scheduledTime;
-                leads[leadIndex].reminderType = aiResponseJson.reminderType || 'followup';
+            // NOVO: NÓS VAMOS CONFIAR NO GEMEINI PARA INCLUIR DADOS DE AGENDAMENTO NO TEXTO
+            // E USAR O OPERADOR MANUALMENTE, POIS O PARSING JSON ESTAVA QUEBRANDO.
 
-                console.log(`[Agendador] Lead ${currentLead.nome} agendado para ${aiResponseJson.scheduledDate} ${aiResponseJson.scheduledTime}`);
-            }
-
-            // 5. SALVA A RESPOSTA DA IA (role: 'model')
+            // SALVA A RESPOSTA DA IA (role: 'model')
             await chatRef.add({
                 role: "model",
                 parts: [{text: aiResponseText}],
                 timestamp: FieldValue.serverTimestamp(),
             });
 
-            // 6. Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
+            // Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
             await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponseText });
 
         } else {
             console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
         }
         
-        // 7. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva agenda e/ou contador)
+        // 4. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva agenda e/ou contador)
         await userDocRef.update({ leads: leads });
         
-        // 8. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador/agenda)
+        // 5. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA
         sendEventToUser(userId, { type: 'message', from: userContact });
 
 
     } catch (error) {
-        console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
+        console.error(`[Baileys - ${userId}] Erro CRÍTICO ao processar mensagem:`, error);
     }
 }
 
