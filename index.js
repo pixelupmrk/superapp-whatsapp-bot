@@ -27,7 +27,7 @@ try {
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
-// Modelo simples e robusto para evitar erros de parsing
+// Modelo simples e robusto
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 
 // --- Configuração do Servidor Express ---
@@ -113,7 +113,7 @@ async function getOrCreateWhatsappClient(userId) {
 async function handleNewMessage(message, userId) {
     const userContact = message.key.remoteJid;
     
-    // --- CORREÇÃO CRÍTICA DO ERRO UNDEFINED NO FIRESTORE ---
+    // --- LÓGICA ROBUSTA DE EXTRAÇÃO DE TEXTO (CORRIGE ERRO UNDEFINED) ---
     let messageText = '';
     if (message.message) {
         // Tenta obter o texto da conversa, extendedText, ou legenda de mídia
@@ -121,21 +121,23 @@ async function handleNewMessage(message, userId) {
                       message.message.extendedTextMessage?.text || 
                       message.message.imageMessage?.caption ||
                       message.message.videoMessage?.caption ||
-                      ''; // Se não for texto ou legenda, retorna string vazia
+                      ''; 
     }
     
-    // Força a ser uma String e garante que não é UNDEFINED antes de salvar
-    messageText = String(messageText || '').trim(); 
+    // Garante que é uma String para o Firestore
+    messageText = String(messageText).trim(); 
     
     if (userContact === 'status@broadcast') {
         return; 
     }
     
-    // Se a mensagem é vazia (só um clique ou uma mídia sem legenda), processamos,
-    // mas evitamos salvar se for apenas espaço em branco.
-    if (messageText.length === 0 && !message.message?.imageMessage && !message.message?.videoMessage) {
+    // Se a mensagem é vazia (só um clique ou mídia sem legenda), salva uma notificação
+    if (messageText.length === 0 && message.message && (message.message.imageMessage || message.message.videoMessage || message.message.audioMessage)) {
         messageText = 'Mídia Recebida (Sem Texto)';
+    } else if (messageText.length === 0) {
+        return; // Ignora mensagens vazias sem mídia
     }
+
 
     try {
         const userDocRef = db.collection('userData').doc(userId);
@@ -180,13 +182,14 @@ async function handleNewMessage(message, userId) {
              leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA (Modo Conversação) ---
         let aiResponseText = ""; 
         
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
+            // CHAMADA SIMPLES DA IA (Sem forçar JSON, apenas texto)
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo e focado em triagem e agendamento.";
             const fullPrompt = `${botInstructions}\n\nVocê está conversando com um cliente chamado ${currentLead.nome}. Mantenha a conversa natural, use negrito e emojis para destacar pontos-chave e tente fechar um agendamento ou follow-up.\n\nMensagem do cliente: "${messageText}"`;
             
@@ -207,7 +210,7 @@ async function handleNewMessage(message, userId) {
             console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
         }
         
-        // 4. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva agenda e/ou contador)
+        // 4. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
         await userDocRef.update({ leads: leads });
         
         // 5. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA
