@@ -124,11 +124,17 @@ async function handleNewMessage(message, userId) {
                       ''; // Se não for texto ou legenda, retorna string vazia
     }
     
-    // Garantimos que nunca seja UNDEFINED antes de salvar no Firestore
+    // Força a ser uma String e garante que não é UNDEFINED antes de salvar
     messageText = String(messageText || '').trim(); 
     
     if (userContact === 'status@broadcast') {
         return; 
+    }
+    
+    // Se a mensagem é vazia (só um clique ou uma mídia sem legenda), processamos,
+    // mas evitamos salvar se for apenas espaço em branco.
+    if (messageText.length === 0 && !message.message?.imageMessage && !message.message?.videoMessage) {
+        messageText = 'Mídia Recebida (Sem Texto)';
     }
 
     try {
@@ -161,10 +167,10 @@ async function handleNewMessage(message, userId) {
         // --- 2. LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
-        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user') - SEMPRE SALVA!
+        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
         await chatRef.add({
             role: "user",
-            parts: [{text: messageText || 'Mídia Recebida (Sem Texto)'}], // Se a string for vazia (só mídia), salva uma notificação
+            parts: [{text: messageText}], 
             timestamp: FieldValue.serverTimestamp(),
         });
         
