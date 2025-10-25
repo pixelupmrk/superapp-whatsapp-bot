@@ -126,12 +126,11 @@ async function handleNewMessage(message, userId) {
         let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
         let isNewLead = false;
 
-        // === 1. CRIAÇÃO DE NOVO LEAD ===
+        // === CRIAÇÃO DE NOVO LEAD ===
         if (!currentLead) {
             isNewLead = true;
             console.log(`[CRM - ${userId}] Novo contato!`);
             
-            // Lógica da IA para extrair nome (Feito de forma síncrona para não quebrar a criação do lead)
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
             const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
@@ -142,51 +141,99 @@ async function handleNewMessage(message, userId) {
             leads.push(currentLead);
         }
         
-        // --- 2. LÓGICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
+        // --- INÍCIO DA LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
-        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        // 1. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
         await chatRef.add({
             role: "user",
             parts: [{text: messageText}],
             timestamp: FieldValue.serverTimestamp(),
         });
         
-        // INCREMENTA O CONTADOR (Bolinha de Notificação)
+        // 2. INCREMENTA O CONTADOR (Bolinha de Notificação)
         const leadIndex = leads.findIndex(l => l.id === currentLead.id);
         if (leadIndex !== -1) {
              leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        // ATUALIZA O ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
-        await userDocRef.update({ leads: leads });
-        
-        // NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador)
-        sendEventToUser(userId, { type: 'message', from: userContact });
-
-        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        // --- LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            // Gera resposta da IA
-            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
-            const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
-            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+            // NOVO: ESTRUTURAÇÃO DA RESPOSTA DA IA PARA POSSÍVEL AGENDAMENTO
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo e focado em triagem e agendamento.";
             
-            // SALVA A RESPOSTA DA IA (role: 'model')
+            const fullPrompt = `${botInstructions}\n\nAnalise a mensagem do cliente: "${messageText}". Responda de forma envolvente, mas seu foco principal é extrair a DATA e HORA de um possível agendamento ou follow-up.
+
+            Se você identificar no chat uma intenção clara de agendamento (Ex: "amanhã às 14h", "quarta-feira 10h"), inclua a instrução de agendamento no seu comando de saída (JSON).
+
+            Instrução Final: O resultado deve ser um JSON com a chave 'response_text' (sua resposta de chat) e, *opcionalmente*, a chave 'schedule_info' se houver dados de agendamento. Se não houver agendamento, retorne apenas a chave 'response_text'.`;
+
+            const aiResponseResult = await model.generateContent({
+                contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "object",
+                        properties: {
+                            response_text: {
+                                type: "string",
+                                description: "A resposta amigável e persuasiva para o cliente no WhatsApp (Obrigatório)."
+                            },
+                            scheduledDate: {
+                                type: "string",
+                                description: "A data do agendamento encontrada (Ex: '2025-10-26'). Se não houver, omita."
+                            },
+                            scheduledTime: {
+                                type: "string",
+                                description: "A hora do agendamento encontrada (Ex: '14:30'). Se não houver, omita."
+                            },
+                            reminderType: {
+                                type: "string",
+                                description: "O tipo de compromisso (Ex: 'followup' ou 'meeting'). Se agendado, use 'followup'."
+                            }
+                        },
+                        required: ["response_text"]
+                    }
+                }
+            });
+            
+            const aiResponseJson = JSON.parse(aiResponseResult.text);
+            const aiResponseText = aiResponseJson.response_text;
+            
+            // 4. ATUALIZAÇÃO DO LEAD COM A AGENDA (SE HOUVER)
+            if (aiResponseJson.scheduledDate && aiResponseJson.scheduledTime) {
+                
+                // Atualiza o lead localmente
+                leads[leadIndex].scheduledDate = aiResponseJson.scheduledDate;
+                leads[leadIndex].scheduledTime = aiResponseJson.scheduledTime;
+                leads[leadIndex].reminderType = aiResponseJson.reminderType || 'followup';
+
+                console.log(`[Agendador] Lead ${currentLead.nome} agendado para ${aiResponseJson.scheduledDate} ${aiResponseJson.scheduledTime}`);
+            }
+
+            // 5. SALVA A RESPOSTA DA IA (role: 'model')
             await chatRef.add({
                 role: "model",
-                parts: [{text: aiResponse}],
+                parts: [{text: aiResponseText}],
                 timestamp: FieldValue.serverTimestamp(),
             });
 
-            // Envia a resposta pelo WhatsApp 
-            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
+            // 6. Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
+            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponseText });
 
         } else {
             console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
         }
+        
+        // 7. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva agenda e/ou contador)
+        await userDocRef.update({ leads: leads });
+        
+        // 8. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador/agenda)
+        sendEventToUser(userId, { type: 'message', from: userContact });
+
 
     } catch (error) {
         console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
@@ -199,7 +246,6 @@ app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
     
-    // Tenta obter o cliente (cutucão)
     const sock = await getOrCreateWhatsappClient(userId);
 
     const isConnected = (sock.user && sock.user.id);
@@ -224,7 +270,6 @@ app.post('/send', async (req, res) => {
     if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios' });
     
     const sock = whatsappClients[userId];
-    // Adicionado verificação de conexão ANTES de tentar enviar
     if (!sock || !sock.user || sock.ws.readyState !== sock.ws.OPEN) { 
         return res.status(503).json({ ok: false, error: 'Connection Closed.', details: 'O cliente WhatsApp não está autenticado ou está desconectado.' });
     }
