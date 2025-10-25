@@ -27,7 +27,7 @@ try {
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
-// Ajuste: Modelo agora é chamado de forma simples para generateContent
+// Modelo simples e robusto para evitar erros de parsing
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 
 // --- Configuração do Servidor Express ---
@@ -112,9 +112,24 @@ async function getOrCreateWhatsappClient(userId) {
 
 async function handleNewMessage(message, userId) {
     const userContact = message.key.remoteJid;
-    const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
     
-    if (!messageText || userContact === 'status@broadcast') return;
+    // --- CORREÇÃO CRÍTICA DO ERRO UNDEFINED NO FIRESTORE ---
+    let messageText = '';
+    if (message.message) {
+        // Tenta obter o texto da conversa, extendedText, ou legenda de mídia
+        messageText = message.message.conversation || 
+                      message.message.extendedTextMessage?.text || 
+                      message.message.imageMessage?.caption ||
+                      message.message.videoMessage?.caption ||
+                      ''; // Se não for texto ou legenda, retorna string vazia
+    }
+    
+    // Garantimos que nunca seja UNDEFINED antes de salvar no Firestore
+    messageText = String(messageText || '').trim(); 
+    
+    if (userContact === 'status@broadcast') {
+        return; 
+    }
 
     try {
         const userDocRef = db.collection('userData').doc(userId);
@@ -143,13 +158,13 @@ async function handleNewMessage(message, userId) {
             leads.push(currentLead);
         }
         
-        // --- 2. LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
+        // --- 2. LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
-        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user') - SEMPRE SALVA!
         await chatRef.add({
             role: "user",
-            parts: [{text: messageText}],
+            parts: [{text: messageText || 'Mídia Recebida (Sem Texto)'}], // Se a string for vazia (só mídia), salva uma notificação
             timestamp: FieldValue.serverTimestamp(),
         });
         
@@ -160,22 +175,18 @@ async function handleNewMessage(message, userId) {
         }
 
         // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
-        let aiResponseText = ""; // Variável para armazenar a resposta final
+        let aiResponseText = ""; 
         
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            // NOVO: Chamada simples e robusta para o Gemini
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo e focado em triagem e agendamento.";
             const fullPrompt = `${botInstructions}\n\nVocê está conversando com um cliente chamado ${currentLead.nome}. Mantenha a conversa natural, use negrito e emojis para destacar pontos-chave e tente fechar um agendamento ou follow-up.\n\nMensagem do cliente: "${messageText}"`;
             
             const aiResponseResult = await model.generateContent(fullPrompt);
             aiResponseText = aiResponseResult.text;
             
-            // NOVO: NÓS VAMOS CONFIAR NO GEMEINI PARA INCLUIR DADOS DE AGENDAMENTO NO TEXTO
-            // E USAR O OPERADOR MANUALMENTE, POIS O PARSING JSON ESTAVA QUEBRANDO.
-
             // SALVA A RESPOSTA DA IA (role: 'model')
             await chatRef.add({
                 role: "model",
