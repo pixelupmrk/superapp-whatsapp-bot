@@ -3,7 +3,7 @@ const cors = require('cors');
 const qrcode = require('qrcode');
 const { 
     default: makeWASocket, 
-    useMultiFileAuthState, // AINDA USAMOS PARA TESTE
+    useMultiFileAuthState, 
     makeInMemoryStore, 
     DisconnectReason 
 } = require('@whiskeysockets/baileys');
@@ -55,8 +55,6 @@ async function getOrCreateWhatsappClient(userId) {
     
     console.log(`[Sistema] Inicializando cliente Baileys para: ${userId}`);
     
-    // --- IMPORTANTE: TENTA SALVAR A SESSÃO NO DISCO TEMPORÁRIO ---
-    // Em produção, isso seria substituído por um banco de dados (Firestore)
     const { state, saveCreds } = await useMultiFileAuthState(`baileys_auth_${userId}`);
 
     sock = makeWASocket({
@@ -68,7 +66,6 @@ async function getOrCreateWhatsappClient(userId) {
 
     store.bind(sock.ev);
     
-    // --- Funções de Mensagens ---
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const message = messages[0];
         if (!message.key.fromMe && message.key.remoteJid !== 'status@broadcast' && message.remoteJid !== 'status@broadcast') {
@@ -76,7 +73,6 @@ async function getOrCreateWhatsappClient(userId) {
         }
     });
 
-    // --- Lógica de Conexão e QR Code ---
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
@@ -126,69 +122,66 @@ async function handleNewMessage(message, userId) {
         
         let userData = userDoc.data();
         let leads = userData.leads || [];
-        // Normaliza o número para o formato Baileys (user@s.whatsapp.net)
         const normalizedContact = userContact.split('@')[0];
         let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
         let isNewLead = false;
 
-        // === CRIAÇÃO DE NOVO LEAD ===
+        // === 1. CRIAÇÃO DE NOVO LEAD ===
         if (!currentLead) {
             isNewLead = true;
             console.log(`[CRM - ${userId}] Novo contato!`);
             
-            // 1. Lógica da IA para extrair nome
+            // Lógica da IA para extrair nome (Feito de forma síncrona para não quebrar a criação do lead)
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
             const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
             
-            // 2. Cria o novo lead
             const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
             currentLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true, unreadCount: 0 }; 
             
-            // 3. Adiciona o novo lead localmente para processamento
             leads.push(currentLead);
         }
         
-        // --- INÍCIO DA LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
+        // --- 2. LÓGICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
-        // 1. SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user') - SEMPRE SALVA
+        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
         await chatRef.add({
             role: "user",
             parts: [{text: messageText}],
             timestamp: FieldValue.serverTimestamp(),
         });
         
-        // 2. INCREMENTA O CONTADOR (Bolinha de Notificação) - SEMPRE INCREMENTA
+        // INCREMENTA O CONTADOR (Bolinha de Notificação)
         const leadIndex = leads.findIndex(l => l.id === currentLead.id);
         if (leadIndex !== -1) {
              leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        // 3. ATUALIZA O ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
+        // ATUALIZA O ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
         await userDocRef.update({ leads: leads });
         
-        // 4. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador)
+        // NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador)
         sendEventToUser(userId, { type: 'message', from: userContact });
 
-        // --- LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            // 5. Gera resposta da IA
+            // Gera resposta da IA
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
             const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
             
-            // 6. SALVA A RESPOSTA DA IA (role: 'model')
+            // SALVA A RESPOSTA DA IA (role: 'model')
             await chatRef.add({
                 role: "model",
                 parts: [{text: aiResponse}],
                 timestamp: FieldValue.serverTimestamp(),
             });
 
-            // 7. Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
+            // Envia a resposta pelo WhatsApp 
             await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
 
         } else {
@@ -206,6 +199,7 @@ app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
     
+    // Tenta obter o cliente (cutucão)
     const sock = await getOrCreateWhatsappClient(userId);
 
     const isConnected = (sock.user && sock.user.id);
@@ -230,14 +224,13 @@ app.post('/send', async (req, res) => {
     if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios' });
     
     const sock = whatsappClients[userId];
-    if (!sock || !sock.user) {
-        return res.status(400).json({ ok: false, error: 'O cliente WhatsApp não está conectado.' });
+    // Adicionado verificação de conexão ANTES de tentar enviar
+    if (!sock || !sock.user || sock.ws.readyState !== sock.ws.OPEN) { 
+        return res.status(503).json({ ok: false, error: 'Connection Closed.', details: 'O cliente WhatsApp não está autenticado ou está desconectado.' });
     }
 
     try {
         const normalizedTo = to.includes('@s.whatsapp.net') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
-        // OBS: O salvamento no Firestore para a mensagem do operador foi movido para o Front-end
-        // (no script.js) para garantir a atualização imediata da tela.
         await sock.sendMessage(normalizedTo, { text: text });
         return res.status(200).json({ ok: true, message: 'Mensagem enviada com sucesso!' });
     } catch (error) {
