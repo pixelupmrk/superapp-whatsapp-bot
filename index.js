@@ -27,8 +27,7 @@ try {
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
-// Modelo simples e robusto
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // --- Configuração do Servidor Express ---
 const app = express();
@@ -112,45 +111,9 @@ async function getOrCreateWhatsappClient(userId) {
 
 async function handleNewMessage(message, userId) {
     const userContact = message.key.remoteJid;
+    const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
     
-    // --- LÓGICA ROBUSTA DE EXTRAÇÃO DE TEXTO (CORRIGE ERRO UNDEFINED) ---
-    let messageText = '';
-    const content = message.message; 
-    
-    if (content) {
-        // Tenta obter o texto da conversa, extendedText, ou legenda de mídia
-        messageText = content.conversation || 
-                      content.extendedTextMessage?.text || 
-                      content.imageMessage?.caption ||
-                      content.videoMessage?.caption ||
-                      content.documentMessage?.caption ||
-                      ''; // Se não for texto ou legenda, retorna string vazia
-    }
-    
-    // Garante que é uma String para o Firestore
-    messageText = String(messageText).trim(); 
-    
-    if (userContact === 'status@broadcast') {
-        return; 
-    }
-    
-    // Se a mensagem é vazia, mas não é uma mídia, a tratamos como Mídia Recebida (para o histórico)
-    if (messageText.length === 0 && content) {
-        const isMedia = content.imageMessage || content.videoMessage || content.audioMessage || content.documentMessage;
-        const isSticker = content.stickerMessage;
-
-        if (isMedia) {
-            messageText = 'Mídia Recebida (Sem Legenda)';
-        } else if (isSticker) {
-            messageText = 'Sticker/Figurinha Recebida';
-        } else {
-             // Se for uma mensagem de sistema ou outro tipo desconhecido, ignoramos.
-             return; 
-        }
-    } else if (messageText.length === 0) {
-        return; // Ignora mensagens que são apenas espaços ou vazias sem mídia.
-    }
-
+    if (!messageText || userContact === 'status@broadcast') return;
 
     try {
         const userDocRef = db.collection('userData').doc(userId);
@@ -168,7 +131,7 @@ async function handleNewMessage(message, userId) {
             isNewLead = true;
             console.log(`[CRM - ${userId}] Novo contato!`);
             
-            // Lógica da IA para extrair nome 
+            // Lógica da IA para extrair nome (Feito de forma síncrona para não quebrar a criação do lead)
             const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
             const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
             const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
@@ -179,13 +142,13 @@ async function handleNewMessage(message, userId) {
             leads.push(currentLead);
         }
         
-        // --- 2. LÓGICA CRÍTICA DE SALVAMENTO E NOTIFICAÇÃO ---
+        // --- 2. LÓGICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
         const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
         
         // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
         await chatRef.add({
             role: "user",
-            parts: [{text: messageText}], 
+            parts: [{text: messageText}],
             timestamp: FieldValue.serverTimestamp(),
         });
         
@@ -195,49 +158,38 @@ async function handleNewMessage(message, userId) {
              leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA (Modo Conversação) ---
-        let aiResponseText = ""; 
+        // ATUALIZA O ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
+        await userDocRef.update({ leads: leads });
         
+        // NOTIFICA O FRONT-END PARA RECARREGAR A LISTA (Devido ao novo lead ou contador)
+        sendEventToUser(userId, { type: 'message', from: userContact });
+
+        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
         if (currentLead.botActive === true) {
             
             console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            // CHAMADA SIMPLES DA IA (Modo Conversação)
-            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo e focado em triagem e agendamento.";
-            const fullPrompt = `${botInstructions}\n\nVocê está conversando com um cliente chamado ${currentLead.nome}. Mantenha a conversa natural, use negrito e emojis para destacar pontos-chave e tente fechar um agendamento ou follow-up.\n\nMensagem do cliente: "${messageText}"`;
-            
-            const aiResponseResult = await model.generateContent(fullPrompt);
-            aiResponseText = aiResponseResult.text;
+            // Gera resposta da IA
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const fullPrompt = `${botInstructions}\n\nMensagem do cliente: "${messageText}"`;
+            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
             
             // SALVA A RESPOSTA DA IA (role: 'model')
             await chatRef.add({
                 role: "model",
-                parts: [{text: aiResponseText}],
+                parts: [{text: aiResponse}],
                 timestamp: FieldValue.serverTimestamp(),
             });
 
-            // Envia a resposta pelo WhatsApp (só se o Bot estiver ativo)
-            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponseText });
+            // Envia a resposta pelo WhatsApp 
+            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
 
         } else {
             console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
         }
-        
-        // 4. ATUALIZAÇÃO FINAL DO ARRAY DE LEADS NO FIRESTORE (Salva novo lead e/ou contador)
-        await userDocRef.update({ leads: leads });
-        
-        // 5. NOTIFICA O FRONT-END PARA RECARREGAR A LISTA
-        sendEventToUser(userId, { type: 'message', from: userContact });
-
 
     } catch (error) {
-        console.error(`[Baileys - ${userId}] Erro CRÍTICO ao processar mensagem:`, error);
-        // Tenta salvar uma mensagem de erro no chat (para debug)
-        await chatRef.add({
-            role: "model",
-            parts: [{text: "ERRO INTERNO: Falha ao processar a mensagem do cliente. Verifique os logs do Bot."}],
-            timestamp: FieldValue.serverTimestamp(),
-        });
+        console.error(`[Baileys - ${userId}] Erro ao processar mensagem:`, error);
     }
 }
 
@@ -247,6 +199,7 @@ app.get('/status', async (req, res) => {
     const userId = req.query.userId;
     if (!userId) return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
     
+    // Tenta obter o cliente (cutucão)
     const sock = await getOrCreateWhatsappClient(userId);
 
     const isConnected = (sock.user && sock.user.id);
@@ -271,6 +224,7 @@ app.post('/send', async (req, res) => {
     if (!to || !text || !userId) return res.status(400).json({ ok: false, error: 'Campos to, text e userId são obrigatórios' });
     
     const sock = whatsappClients[userId];
+    // Adicionado verificação de conexão ANTES de tentar enviar
     if (!sock || !sock.user || sock.ws.readyState !== sock.ws.OPEN) { 
         return res.status(503).json({ ok: false, error: 'Connection Closed.', details: 'O cliente WhatsApp não está autenticado ou está desconectado.' });
     }
