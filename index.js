@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
+const fs = require('fs'); // Adicionado para manipulação de arquivos
+const path = require('path'); // Adicionado para manipulação de caminhos
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
@@ -46,10 +48,24 @@ function sendEventToUser(userId, data) {
     }
 }
 
+// --- NOVA FUNÇÃO: Deletar Credenciais ---
+function deleteAuthFiles(userId) {
+    const authPath = path.join(process.cwd(), `baileys_auth_${userId}`);
+    console.log(`[Sistema] Tentando deletar arquivos de autenticação para ${userId}: ${authPath}`);
+    try {
+        // Deleta a pasta de sessão de forma recursiva
+        fs.rmSync(authPath, { recursive: true, force: true });
+        console.log(`[Sistema] Arquivos de autenticação deletados para ${userId}.`);
+    } catch (err) {
+        console.error(`[Sistema] Erro ao deletar arquivos de autenticação para ${userId}:`, err.message);
+    }
+}
+
 async function getOrCreateWhatsappClient(userId) {
     let sock = whatsappClients[userId];
     
-    if (sock && sock.user) {
+    // Verificação de conexão mais robusta para evitar reconexão desnecessária
+    if (sock && sock.user && sock.ws.readyState === sock.ws.OPEN) {
         return sock;
     }
     
@@ -73,6 +89,7 @@ async function getOrCreateWhatsappClient(userId) {
         }
     });
 
+    // --- LÓGICA DE RECONEXÃO ATUALIZADA ---
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
@@ -84,11 +101,21 @@ async function getOrCreateWhatsappClient(userId) {
         }
 
         if (connection === 'close') {
+            // Verifica o motivo do fechamento. Apenas 'loggedOut' (401) não deve tentar reconectar.
             const shouldReconnect = (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut);
+            
             console.log(`[Baileys - ${userId}] Conexão fechada. Tentando reconectar: ${shouldReconnect}`);
             sendEventToUser(userId, { type: 'status', connected: false, status: 'Fechado/Desconectado' });
+            
             if (shouldReconnect) {
+                // Tenta reconectar chamando a própria função
                 getOrCreateWhatsappClient(userId); 
+            } else {
+                // Logout permanente (401). Deleta os arquivos para forçar um novo QR Code.
+                console.log(`[Baileys - ${userId}] Logout Permanente. Deletando credenciais para novo login.`);
+                deleteAuthFiles(userId); // <--- CHAMADA DA NOVA FUNÇÃO
+                // A função não precisa chamar getOrCreateWhatsappClient(userId); porque 
+                // o frontend ou o PM2 farão isso em seguida.
             }
         } else if (connection === 'open') {
             console.log(`[Baileys - ${userId}] Conectado!`);
@@ -202,7 +229,8 @@ app.get('/status', async (req, res) => {
     // Tenta obter o cliente (cutucão)
     const sock = await getOrCreateWhatsappClient(userId);
 
-    const isConnected = (sock.user && sock.user.id);
+    // Usa a mesma verificação de conexão robusta
+    const isConnected = (sock.user && sock.ws.readyState === sock.ws.OPEN);
 
     if (!isConnected && qrCodeDataStore[userId]) {
         return res.status(200).json({ 
