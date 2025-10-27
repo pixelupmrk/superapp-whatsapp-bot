@@ -17,15 +17,18 @@ const pino = require('pino');
 // --- Configuração do Firebase Admin ---
 let db;
 try {
+    // Agora busca as credenciais no processo (serão carregadas pelo PM2 no arquivo ecosystem.config.js)
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     initializeApp({ credential: cert(serviceAccount) });
     db = getFirestore();
     console.log("[Firebase] Conectado ao Firebase Admin!");
 } catch (error) {
     console.error("[Firebase] ERRO: Verifique a variável de ambiente FIREBASE_SERVICE_ACCOUNT.", error);
+    // Se falhar aqui, o processo vai falhar e o PM2 vai tentar reiniciar, mas a chave é o problema
 }
 
 // --- Configuração da IA ---
+// Agora busca a chave no processo (será carregada pelo PM2 no arquivo ecosystem.config.js)
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
