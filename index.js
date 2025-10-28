@@ -30,7 +30,7 @@ try {
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // Recomendo usar 1.5-flash ou 2.5-flash
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Recomendo usar 1.5-flash ou 2.5-flash
 
 // --- Configuração do Servidor Express ---
 const app = express();
