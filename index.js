@@ -1,308 +1,386 @@
-// === DEPENDÊNCIAS ===
-const http = require('http');
+// index.js CORRIGIDO COM ESTOQUE E GEMINI 2.5 FLASH
+const express = require('express');
+const cors = require('cors');
 const qrcode = require('qrcode');
-const { Client } = require('whatsapp-web.js');
-const admin = require('firebase-admin');
+const fs = require('fs');
+const path = require('path');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    makeInMemoryStore, 
+    DisconnectReason 
+} = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const pino = require('pino');
 
-// === CONFIGURAÇÕES ===
-console.log('Lendo variáveis de ambiente...');
-// As variáveis de ambiente devem ser configuradas no seu serviço Render
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-const firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const crmUserId = process.env.CRM_USER_ID; // ID do usuário principal (Admin) para o qual os leads são salvos
-console.log('Variáveis lidas com sucesso.');
-
-// Inicializa Firebase
+// --- Configuração do Firebase Admin ---
+let db;
 try {
-    if (admin.apps.length === 0) {
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-            databaseURL: `https://${firebaseConfig.projectId}.firebaseio.com`
-        });
-        console.log('✅ Conectado ao Firebase!');
-    }
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    initializeApp({ credential: cert(serviceAccount) });
+    db = getFirestore();
+    console.log("[Firebase] Conectado ao Firebase Admin!");
 } catch (error) {
-    console.error('❌ ERRO AO CONECTAR COM FIREBASE:', error);
-    process.exit(1);
+    console.error("[Firebase] ERRO: Verifique a variável de ambiente FIREBASE_SERVICE_ACCOUNT.", error);
 }
-const db = admin.firestore();
 
-// Inicializa Gemini
-const genAI = new GoogleGenerativeAI(geminiApiKey);
-// Usando 'gemini-pro' para estabilidade ou 'gemini-2.5-flash' se preferir.
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
-// SE QUISER USAR A FLASH, MANTENHA: const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
-console.log('✅ Conectado à API do Gemini!');
+// --- Configuração da IA ---
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) console.error("ERRO: Variável de ambiente GEMINI_API_KEY não encontrada.");
+const genAI = new GoogleGenerativeAI(apiKey);
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // MODELO ESPECIFICADO: gemini-2.5-flash
+console.log("[IA] Modelo Gemini 2.5 Flash configurado.");
 
-// === VARIÁVEIS DE ESTADO ===
-let qrCodeDataUrl = null;
-let botStatus = "Iniciando...";
-let clientReady = false;
+// --- Configuração do Servidor Express ---
+const app = express();
+app.use(cors({ origin: true })); 
+app.use(express.json());
 
-// === SERVIDOR WEB PARA EXIBIR O QR CODE E RECEBER COMANDOS ===
-const server = http.createServer(async (req, res) => {
-    // Permite CORS para que o seu SuperApp possa se comunicar com o bot
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+const port = process.env.PORT || 10000;
+const whatsappClients = {};
+const frontendConnections = {};
+const qrCodeDataStore = {}; 
+const store = makeInMemoryStore(pino({ level: 'silent' }).child({ level: 'silent', stream: 'store' }));
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
+function sendEventToUser(userId, data) {
+    if (frontendConnections[userId]) {
+        frontendConnections[userId].res.write(`data: ${JSON.stringify(data)}\n\n`);
     }
+}
 
-    // Rota para exibir o QR Code ou Status
-    if (req.url === '/' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        if (qrCodeDataUrl) {
-            res.end(`
-                <body style="background-color: #1a1a2e;">
-                    <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
-                        <h1>Escaneie para Conectar</h1>
-                        <p>Abra o WhatsApp no seu celular e escaneie a imagem abaixo.</p>
-                        <img src="${qrCodeDataUrl}" alt="QR Code do WhatsApp" style="width: 300px; height: 300px; background-color: white; padding: 10px; border-radius: 8px;">
-                        <p style="margin-top: 20px;">Após escanear, esta página será atualizada com a mensagem de confirmação.</p>
-                    </div>
-                </body>
-            `);
-        } else {
-            res.end(`
-                <body style="background-color: #1a1a2e;">
-                    <div style="font-family: sans-serif; text-align: center; padding: 40px; color: #cdd6f4;">
-                        <h1>SuperApp WhatsApp Bot</h1>
-                        <p><strong>Status:</strong> ${botStatus}</p>
-                        <p>Se o QR Code não aparecer em 30 segundos, atualize a página.</p>
-                    </div>
-                </body>
-            `);
+// --- Funções do Sistema Baileys ---
+
+function deleteAuthFiles(userId) {
+    const authPath = path.join(process.cwd(), `baileys_auth_${userId}`);
+    console.log(`[Sistema] Tentando deletar arquivos de autenticação para ${userId}: ${authPath}`);
+    try {
+        fs.rmSync(authPath, { recursive: true, force: true });
+        console.log(`[Sistema] Arquivos de autenticação deletados para ${userId}.`);
+    } catch (err) {
+        console.error(`[Sistema] Erro ao deletar arquivos de autenticação para ${userId}:`, err.message);
+    }
+}
+
+async function getOrCreateWhatsappClient(userId) {
+    let sock = whatsappClients[userId];
+    
+    if (sock && sock.user && sock.ws.readyState === sock.ws.OPEN) {
+        return sock;
+    }
+    
+    console.log(`[Sistema] Inicializando cliente Baileys para: ${userId}`);
+    
+    const { state, saveCreds } = await useMultiFileAuthState(`baileys_auth_${userId}`);
+
+    sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: state,
+        browser: ['SuperApp', 'Chrome', '100.0.0']
+    });
+
+    store.bind(sock.ev);
+    
+    // LÓGICA DE MENSAGENS
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const message = messages[0];
+        if (message.key.remoteJid === 'status@broadcast') return;
+
+        if (!message.key.fromMe) {
+            await handleNewMessage(message, userId);
+        } else if (message.key.fromMe) {
+            await handleOutgoingMessage(message, userId);
         }
-        return;
-    }
+    });
 
-    // Rota para o Super App enviar mensagens
-    if (req.url === '/send-message' && req.method === 'POST') {
-        if (!clientReady) {
-            res.writeHead(503, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: 'Cliente WhatsApp não está pronto.' }));
-            return;
+    // LÓGICA DE RECONEXÃO
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            qrcode.toDataURL(qr, (err, url) => {
+                qrCodeDataStore[userId] = url; 
+                sendEventToUser(userId, { type: 'qr', data: url });
+            });
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut);
+            
+            console.log(`[Baileys - ${userId}] Conexão fechada. Tentando reconectar: ${shouldReconnect}`);
+            sendEventToUser(userId, { type: 'status', connected: false, status: 'Fechado/Desconectado' });
+            
+            if (shouldReconnect) {
+                getOrCreateWhatsappClient(userId); 
+            } else {
+                console.log(`[Baileys - ${userId}] Logout Permanente. Deletando credenciais para novo login.`);
+                deleteAuthFiles(userId);
+            }
+        } else if (connection === 'open') {
+            console.log(`[Baileys - ${userId}] Conectado!`);
+            delete qrCodeDataStore[userId];
+            sendEventToUser(userId, { 
+                type: 'status', 
+                connected: true, 
+                user: sock.user.name || sock.user.id.user 
+            });
+        }
+    });
+    
+    sock.ev.on('creds.update', saveCreds);
+
+    whatsappClients[userId] = sock;
+    return sock;
+}
+
+
+// --- Funções Auxiliares do Bot e IA ---
+
+async function getEstoqueInfo(userData) {
+    const estoque = userData.estoque || [];
+    if (estoque.length === 0) return "";
+    
+    let info = "INFORMAÇÃO DE ESTOQUE ATUAL: Use esta lista para responder sobre produtos ou preços. NÃO REVELE CUSTOS.";
+    
+    estoque.forEach(p => {
+        const produtoNome = p.produto || 'Item';
+        // Confere se o preço de venda é um número antes de usar toFixed(2)
+        const preco = (typeof p.venda === 'number' && !isNaN(p.venda)) ? `R$${p.venda.toFixed(2)}` : 'Preço N/A';
+        
+        // Apenas Produto e Venda são expostos.
+        info += `[Produto: ${produtoNome} | Preço de Venda ao Cliente: ${preco}]; `;
+    });
+    
+    return info + " Nunca mencione o valor de compra ou custos internos.";
+}
+
+
+async function handleNewMessage(message, userId) {
+    const userContact = message.key.remoteJid;
+    const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
+    
+    if (!messageText || userContact === 'status@broadcast') return;
+
+    try {
+        const userDocRef = db.collection('userData').doc(userId);
+        const userDoc = await userDocRef.get();
+        if (!userDoc.exists) return;
+        
+        let userData = userDoc.data();
+        let leads = userData.leads || [];
+        const normalizedContact = userContact.split('@')[0];
+        let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
+        let isNewLead = false;
+
+        // === 1. CRIAÇÃO DE NOVO LEAD ===
+        if (!currentLead) {
+            isNewLead = true;
+            console.log(`[CRM - ${userId}] Novo contato!`);
+            
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const promptTemplate = `${botInstructions}\n\nAnalise a mensagem: "${messageText}". Extraia o nome do remetente. Responda APENAS com o nome. Se não achar, responda "Novo Contato".`;
+            const leadName = (await (await model.generateContent(promptTemplate)).response).text().trim();
+            
+            const nextId = leads.length > 0 ? Math.max(...leads.map(l => l.id || 0)) + 1 : 1;
+            currentLead = { id: nextId, nome: leadName, whatsapp: userContact, status: 'novo', botActive: true, unreadCount: 0 }; 
+            
+            leads.push(currentLead);
         }
         
-        let body = '';
-        req.on('data', chunk => { body += chunk.toString(); });
-        req.on('end', async () => {
-            try {
-                const { number, message, leadId } = JSON.parse(body);
-                if (!number || !message || !leadId) {
-                    throw new Error('Número, mensagem e leadId são necessários.');
-                }
-                
-                const chatId = `${number}@c.us`;
-                await client.sendMessage(chatId, message);
-                await salvarMensagemNoHistorico(leadId, 'operator', message);
-                
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true }));
-                console.log(`Mensagem manual enviada para ${number} pelo CRM.`);
-
-            } catch (error) {
-                console.error("Erro ao enviar mensagem manual:", error);
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: error.message }));
-            }
+        // --- 2. LÓGICA DE SALVAMENTO E NOTIFICAÇÃO (SEMPRE ACONTECE) ---
+        const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
+        
+        // SALVA A MENSAGEM RECEBIDA DO CLIENTE (role: 'user')
+        await chatRef.add({
+            role: "user",
+            parts: [{text: messageText}],
+            timestamp: FieldValue.serverTimestamp(),
         });
-        return;
-    }
-
-    res.writeHead(404).end();
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`✅ Servidor web rodando na porta ${PORT}.`); });
-
-// === BOT DO WHATSAPP ===
-const client = new Client({ puppeteer: { headless: true, args: [ '--no-sandbox', '--disable-setuid-sandbox' ] } });
-
-client.on('qr', async (qr) => {
-    console.log("QR Code recebido, gerando imagem...");
-    botStatus = "Aguardando escaneamento do QR Code.";
-    qrCodeDataUrl = await qrcode.toDataURL(qr);
-});
-
-client.on('ready', () => { 
-    clientReady = true; 
-    botStatus = "Conectado com sucesso! O bot já está funcionando.";
-    qrCodeDataUrl = null; 
-    console.log('✅ Cliente WhatsApp conectado e pronto para trabalhar!'); 
-});
-
-client.on('disconnected', (reason) => { 
-    clientReady = false;
-    botStatus = `Desconectado: ${reason}. Reiniciando...`;
-    console.log('❌ Cliente foi desconectado!', reason);
-    client.initialize();
-});
-
-const conversas = {};
-const PROMPT_PADRAO_BASE = `Você é um assistente virtual. Sua função é fazer o pré-atendimento. Colete o nome, assunto, orçamento e prazo do cliente. Ao final, retorne um JSON com a chave "finalizado" como true e os dados coletados.`;
-
-
-client.on('message', async message => {
-    const contato = message.from;
-    const textoRecebido = message.body;
-    console.log(`Mensagem de ${contato}: "${textoRecebido}"`);
-    if (message.isGroup) return;
-
-    // 1. Encontrar o Lead e salvar a mensagem
-    const leadId = await encontrarOuCriarLead(contato);
-    if(leadId) await salvarMensagemNoHistorico(leadId, 'user', textoRecebido);
-
-    // 2. Carregar Prompt do Usuário (e agora, o Estoque!)
-    let promptDoUsuario = PROMPT_PADRAO_BASE;
-    let estoqueText = "";
-
-    try {
-        if (crmUserId) {
-            const userDoc = await db.collection('userData').doc(crmUserId).get();
-            const userData = userDoc.data();
-
-            // Carrega o prompt de IA salvo pelo cliente no SuperApp
-            if (userData && userData.botPrompt) {
-                promptDoUsuario = userData.botPrompt;
-            }
-
-            // NOVO: Carrega e formata os dados de Estoque
-            const estoque = userData.estoque || [];
-            if (estoque.length > 0) {
-                estoqueText = "INFORMAÇÃO DE ESTOQUE ATUAL: Os produtos disponíveis no momento são: ";
-                estoque.forEach(p => {
-                    // Assume que 'quantidade' é um campo, senão usará 'Não especificada'
-                    const quantidade = p.quantidade !== undefined ? p.quantidade : 'Não especificada';
-                    estoqueText += `Produto: ${p.produto} (Preço de Venda: R$${p.venda ? p.venda.toFixed(2) : 'N/A'}, Quantidade: ${quantidade}); `;
-                });
-                estoqueText += "Use esta informação para responder perguntas sobre produtos e disponibilidade.";
-            }
-
-        }
-    } catch (error) {
-        console.error("Erro ao carregar prompt/estoque do usuário, usando o padrão:", error);
-    }
-
-    // 3. Montar o Prompt Final com o Estoque
-    const finalPrompt = estoqueText ? `${promptDoUsuario}\n\n${estoqueText}` : promptDoUsuario;
-    
-    // 4. Iniciar/Continuar Conversa
-    if (!conversas[contato]) {
-        conversas[contato] = [
-            { role: "user", parts: [{ text: finalPrompt }] },
-            { role: "model", parts: [{ text: "Ok, entendi minhas instruções e o estoque. Estou pronto para começar." }] }
-        ];
-    }
-    
-    conversas[contato].push({ role: "user", parts: [{ text: textoRecebido }] });
-
-    try {
-        const result = await geminiModel.generateContent({ contents: conversas[contato] });
-        const respostaIA = result.response.text();
-        console.log(`Resposta da IA: "${respostaIA}"`);
         
-        conversas[contato].push({ role: "model", parts: [{ text: respostaIA }] });
-
-        let dadosExtraidos;
-        try {
-            dadosExtraidos = JSON.parse(respostaIA);
-        } catch (e) {
-            await client.sendMessage(contato, respostaIA);
-            if(leadId) await salvarMensagemNoHistorico(leadId, 'bot', respostaIA);
-            return;
+        const leadIndex = leads.findIndex(l => l.id === currentLead.id);
+        if (leadIndex !== -1) {
+             leads[leadIndex].unreadCount = (leads[leadIndex].unreadCount || 0) + 1;
         }
 
-        if (dadosExtraidos && dadosExtraidos.finalizado === true) {
-            console.log("Conversa finalizada. Atualizando lead no CRM...");
-            const leadData = dadosExtraidos.dados_cliente || dadosExtraidos;
-            leadData.whatsapp = contato.replace('@c.us', '');
+        await userDocRef.update({ leads: leads });
+        
+        sendEventToUser(userId, { type: 'message', from: userContact });
+
+        // --- 3. LÓGICA CONDICIONAL DE RESPOSTA DA IA ---
+        if (currentLead.botActive === true) {
             
-            await atualizarLead(leadId, leadData);
+            console.log(`[Bot - ${userId}] Bot ativo. Gerando resposta para ${currentLead.nome}.`);
             
-            const msgFinal = `Obrigado, ${leadData.nome}! Recebi suas informações. Um de nossos especialistas entrará em contato em breve para falar sobre seu projeto de "${leadData.assunto}".`;
-            await client.sendMessage(contato, msgFinal);
-            if(leadId) await salvarMensagemNoHistorico(leadId, 'bot', msgFinal);
-            delete conversas[contato];
+            // BUSCA E FORMATA O ESTOQUE
+            const estoqueInfo = await getEstoqueInfo(userData);
+            
+            // CRIA O PROMPT COMPLETO
+            const botInstructions = userData.botInstructions || "Você é um assistente virtual prestativo.";
+            const fullPrompt = `${botInstructions}\n\n${estoqueInfo}\n\nMensagem do cliente: "${messageText}"`;
+            
+            const aiResponse = (await (await model.generateContent(fullPrompt)).response).text();
+            
+            // SALVA A RESPOSTA DA IA (role: 'model')
+            await chatRef.add({
+                role: "model",
+                parts: [{text: aiResponse}],
+                timestamp: FieldValue.serverTimestamp(),
+            });
+
+            // Envia a resposta pelo WhatsApp 
+            await whatsappClients[userId].sendMessage(message.key.remoteJid, { text: aiResponse });
+
+        } else {
+            console.log(`[Bot - ${userId}] Bot desativado para ${currentLead.nome}. Apenas salvando no histórico.`);
         }
+
     } catch (error) {
-        console.error("❌ Erro na comunicação com o Gemini:", error);
-        conversas[contato].pop();
-        await client.sendMessage(contato, "Desculpe, estou com um problema técnico no momento. Tente novamente mais tarde.");
+        console.error(`[Baileys - ${userId}] Erro ao processar mensagem (handleNewMessage):`, error);
+    }
+}
+
+
+async function handleOutgoingMessage(message, userId) {
+    const userContact = message.key.remoteJid;
+    const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
+    
+    if (!messageText || userContact === 'status@broadcast') return;
+
+    try {
+        const userDocRef = db.collection('userData').doc(userId);
+        const userDoc = await userDocRef.get();
+        if (!userDoc.exists) return;
+
+        let userData = userDoc.data();
+        let leads = userData.leads || [];
+        const normalizedContact = userContact.split('@')[0];
+        let currentLead = leads.find(lead => (lead.whatsapp || '').includes(normalizedContact));
+
+        if (!currentLead) return; 
+
+        // Só salve se o bot estiver INATIVO (ou seja, se a mensagem foi enviada pelo celular)
+        if (currentLead.botActive === false) {
+            
+            console.log(`[Sistema - ${userId}] Salvando mensagem manual (do celular) para ${currentLead.nome}`);
+            
+            const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(currentLead.id)).collection('chatHistory');
+            
+            // SALVA A MENSAGEM (role: 'model' para o lado do negócio/atendente)
+            await chatRef.add({
+                role: "model",
+                parts: [{text: messageText}],
+                timestamp: FieldValue.serverTimestamp(),
+            });
+
+            // Limpa o contador de não lidas quando você responde
+            const leadIndex = leads.findIndex(l => l.id === currentLead.id);
+            if (leadIndex !== -1 && (leads[leadIndex].unreadCount || 0) > 0) {
+                leads[leadIndex].unreadCount = 0;
+                await userDocRef.update({ leads: leads });
+                sendEventToUser(userId, { type: 'message', from: userContact });
+            }
+        }
+        
+    } catch (error) {
+        console.error(`[Sistema - ${userId}] Erro ao processar mensagem enviada (handleOutgoingMessage):`, error);
+    }
+}
+
+
+// --- Endpoints para o Frontend (Super App) ---
+
+app.get('/status', async (req, res) => {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ connected: false, error: 'userId é obrigatório' });
+    
+    const sock = await getOrCreateWhatsappClient(userId);
+    const isConnected = (sock.user && sock.ws.readyState === sock.ws.OPEN);
+
+    if (!isConnected && qrCodeDataStore[userId]) {
+        return res.status(200).json({ 
+            connected: false, 
+            status: 'QR_AVAILABLE', 
+            qrCodeUrl: qrCodeDataStore[userId] 
+        });
+    }
+    
+    return res.status(200).json({ 
+        connected: isConnected, 
+        user: isConnected ? sock.user.name : 'Dispositivo',
+        status: isConnected ? 'CONNECTED' : 'CLOSED'
+    });
+});
+
+// ENDPOINT /send ATUALIZADO
+app.post('/send', async (req, res) => {
+    // AGORA EXIGE 'leadId' DO FRONTEND
+    const { to, text, userId, leadId } = req.body;
+    if (!to || !text || !userId || !leadId) { 
+        return res.status(400).json({ ok: false, error: 'Campos to, text, userId e leadId são obrigatórios' });
+    }
+    
+    const sock = whatsappClients[userId];
+    if (!sock || !sock.user || sock.ws.readyState !== sock.ws.OPEN) { 
+        return res.status(503).json({ ok: false, error: 'Connection Closed.', details: 'O cliente WhatsApp não está autenticado ou está desconectado.' });
+    }
+
+    try {
+        // --- ETAPA DE SALVAR ---
+        const chatRef = db.collection('userData').doc(userId).collection('leads').doc(String(leadId)).collection('chatHistory');
+        await chatRef.add({
+            role: "model", // "model" é usado para o lado do "negócio/atendente"
+            parts: [{text: text}],
+            timestamp: FieldValue.serverTimestamp(),
+        });
+
+        // 2. Limpa o contador de não lidas (Boa prática)
+        const userDocRef = db.collection('userData').doc(userId);
+        const userDoc = await userDocRef.get();
+        if (userDoc.exists) {
+            let leads = userDoc.data().leads || [];
+            const leadIndex = leads.findIndex(l => l.id === Number(leadId));
+            if (leadIndex !== -1) {
+                leads[leadIndex].unreadCount = 0; // Zera o contador
+                await userDocRef.update({ leads: leads });
+                // Notifica o front para atualizar a lista (remover a bolinha)
+                sendEventToUser(userId, { type: 'message', from: to }); 
+            }
+        }
+        // --- FIM DA ETAPA DE SALVAR ---
+
+        // ETAPA DE ENVIAR (JÁ EXISTIA)
+        const normalizedTo = to.includes('@s.whatsapp.net') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+        await sock.sendMessage(normalizedTo, { text: text });
+        
+        return res.status(200).json({ ok: true, message: 'Mensagem enviada e salva com sucesso!' });
+        
+    } catch (error) {
+        console.error(`Erro ao enviar/salvar mensagem para ${to}:`, error);
+        return res.status(500).json({ ok: false, error: `Falha no envio/salvamento da mensagem: ${error.message}` });
     }
 });
 
-// === FUNÇÕES DO BANCO DE DADOS ===
 
-async function salvarMensagemNoHistorico(leadId, sender, text) {
-    if (!crmUserId || !leadId) return;
-    try {
-        const messageData = {
-            sender, text, timestamp: admin.firestore.FieldValue.serverTimestamp()
-        };
-        // Salvando na subcoleção correta: userData/{userId}/leads/{leadId}/messages
-        await db.collection('userData').doc(crmUserId).collection('leads').doc(String(leadId)).collection('messages').add(messageData);
-    } catch (error) {
-        console.error(`Erro ao salvar mensagem para o lead ${leadId}:`, error);
-    }
-}
-
-async function encontrarOuCriarLead(whatsappNumber) {
-    if (!crmUserId) return null;
-    const whatsappId = whatsappNumber.replace('@c.us', '');
-    const userDocRef = db.collection('userData').doc(crmUserId);
+app.get('/events', (req, res) => {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
     
-    const userDoc = await userDocRef.get();
-    let leadsAtuais = userDoc.exists ? (userDoc.data().leads || []) : [];
-    
-    const leadExistente = leadsAtuais.find(l => l.whatsapp === whatsappId);
-    if (leadExistente) {
-        return String(leadExistente.id);
-    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    frontendConnections[userId] = { res };
 
-    const novoLeadId = leadsAtuais.length > 0 ? Math.max(...leadsAtuais.map(l => l.id)) + 1 : 0;
-    const novoLead = {
-        id: novoLeadId,
-        nome: "Novo Contato",
-        whatsapp: whatsappId,
-        origem: "WhatsApp",
-        status: "novo",
-        qualificacao: "",
-        notas: "[Lead criado via Bot]",
-        email: ""
-    };
+    getOrCreateWhatsappClient(userId);
 
-    leadsAtuais.push(novoLead);
-    await userDocRef.set({ leads: leadsAtuais }, { merge: true });
-    console.log(`✅ Novo lead criado para ${whatsappId} com ID ${novoLeadId}`);
-    return String(novoLeadId);
-}
+    req.on('close', () => delete frontendConnections[userId]);
+});
 
-async function atualizarLead(leadId, dadosDoLead) {
-    if (!crmUserId) return;
-    const userDocRef = db.collection('userData').doc(crmUserId);
-    const userDoc = await userDocRef.get();
-    
-    if (userDoc.exists) {
-        let leads = userDoc.data().leads || [];
-        const leadIndex = leads.findIndex(l => String(l.id) === String(leadId));
+// Endpoint de boas-vindas
+app.get('/', (req, res) => {
+    res.status(200).json({ status: "Bot está ativo. Migrado para Baileys." });
+});
 
-        if (leadIndex > -1) {
-            // Atualiza os campos do lead
-            leads[leadIndex].nome = dadosDoLead.nome || leads[leadIndex].nome;
-            leads[leadIndex].status = "progresso"; // Move o status para progresso após qualificação
-            leads[leadIndex].notas = `[Lead atualizado via Bot]\nAssunto: ${dadosDoLead.assunto || "Não informado"}\nOrçamento: ${dadosDoLead.orcamento || "Não informado"}\nPrazo: ${dadosDoLead.prazo || "Não informado"}`;
-            await userDocRef.update({ leads });
-            console.log(`✅ Lead ${leadId} atualizado com os dados do bot.`);
-        }
-    }
-}
-
-console.log("Iniciando o cliente WhatsApp...");
-client.initialize();
+app.listen(port, () => console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`));
