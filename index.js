@@ -1,16 +1,18 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 const express = require("express");
 const qrcode = require("qrcode");
 const app = express();
-const port = 10000;
+const port = 8080; // Porta correta para o Google Cloud Shell
 
-let qrCodeUrl = ""; // Armazena o QR Code atual
+let qrCodeUrl = ""; 
 
 async function connectToWhatsApp() {
+    // Para múltiplos logins, mudaremos 'auth_info' para pastas dinâmicas depois
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true // Mantém no terminal também por segurança
+        printQRInTerminal: true
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -19,7 +21,6 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            // Transforma o QR Code em uma imagem que o navegador entende
             qrCodeUrl = await qrcode.toDataURL(qr);
             console.log("NOVO QR CODE GERADO. ACESSE PELO LINK.");
         }
@@ -34,23 +35,25 @@ async function connectToWhatsApp() {
     });
 }
 
-// Rota para ver o QR Code no navegador
+// Rota para o navegador
 app.get("/qrcode", (req, res) => {
     if (qrCodeUrl === "CONECTADO") {
-        res.send("<h1>O WhatsApp já está conectado!</h1>");
+        res.send("<h1>WhatsApp já está conectado!</h1>");
     } else if (qrCodeUrl) {
         res.send(`
             <html>
-                <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#f0f2f5;font-family:sans-serif;">
-                    <h2>Escaneie o QR Code abaixo:</h2>
-                    <img src="${qrCodeUrl}" style="border:10px solid white;box-shadow:0 0 10px rgba(0,0,0,0.1);">
-                    <p>Atualize a página se o código expirar.</p>
-                    <script>setTimeout(() => { location.reload(); }, 30000);</script>
+                <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#25D366;font-family:sans-serif;color:white;">
+                    <div style="background:white;padding:30px;border-radius:15px;text-align:center;color:#333;">
+                        <h2>Escaneie para Conectar</h2>
+                        <img src="${qrCodeUrl}" style="width:300px;">
+                        <p>O código atualiza sozinho.</p>
+                    </div>
+                    <script>setTimeout(() => { location.reload(); }, 20000);</script>
                 </body>
             </html>
         `);
     } else {
-        res.send("<h1>Gerando QR Code... aguarde e atualize a página.</h1>");
+        res.send("<h1>Gerando QR Code... aguarde 5 segundos e atualize a página.</h1>");
     }
 });
 
