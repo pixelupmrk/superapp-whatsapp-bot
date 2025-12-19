@@ -1,18 +1,20 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 const express = require("express");
 const qrcode = require("qrcode");
+const fs = require("fs");
 const app = express();
-const port = 8080; // Porta correta para o Google Cloud Shell
+const port = 8080; // Alterado para 8080 para funcionar no Google Cloud Shell
 
 let qrCodeUrl = ""; 
 
 async function connectToWhatsApp() {
-    // Para múltiplos logins, mudaremos 'auth_info' para pastas dinâmicas depois
+    // 'auth_info' é a pasta onde o login fica salvo. 
+    // Para múltiplos usuários, depois mudaremos isso para pastas dinâmicas.
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true
+        printQRInTerminal: true // Mantém o QR Code no terminal também
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -21,8 +23,9 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
+            // Gera a imagem do QR Code para o link do navegador
             qrCodeUrl = await qrcode.toDataURL(qr);
-            console.log("NOVO QR CODE GERADO. ACESSE PELO LINK.");
+            console.log("NOVO QR CODE GERADO. ACESSE O LINK PARA ESCANEAR.");
         }
 
         if (connection === 'close') {
@@ -35,25 +38,25 @@ async function connectToWhatsApp() {
     });
 }
 
-// Rota para o navegador
+// Rota para ver o QR Code no navegador
 app.get("/qrcode", (req, res) => {
     if (qrCodeUrl === "CONECTADO") {
-        res.send("<h1>WhatsApp já está conectado!</h1>");
+        res.send("<h1 style='text-align:center; font-family:sans-serif;'>✅ WhatsApp já está conectado!</h1>");
     } else if (qrCodeUrl) {
         res.send(`
             <html>
-                <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#25D366;font-family:sans-serif;color:white;">
-                    <div style="background:white;padding:30px;border-radius:15px;text-align:center;color:#333;">
-                        <h2>Escaneie para Conectar</h2>
-                        <img src="${qrCodeUrl}" style="width:300px;">
-                        <p>O código atualiza sozinho.</p>
+                <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#075E54;font-family:sans-serif;color:white;">
+                    <div style="background:white;padding:40px;border-radius:20px;text-align:center;color:#333;box-shadow: 0 10px 25px rgba(0,0,0,0.2);">
+                        <h2 style="margin-bottom:20px;">Escaneie para Conectar</h2>
+                        <img src="${qrCodeUrl}" style="width:300px; border: 1px solid #ddd; padding: 10px; border-radius: 10px;">
+                        <p style="margin-top:20px; color:#666;">O código atualiza automaticamente a cada 20s.</p>
                     </div>
                     <script>setTimeout(() => { location.reload(); }, 20000);</script>
                 </body>
             </html>
         `);
     } else {
-        res.send("<h1>Gerando QR Code... aguarde 5 segundos e atualize a página.</h1>");
+        res.send("<h1 style='text-align:center; font-family:sans-serif;'>⏳ Gerando QR Code... Aguarde 10 segundos e atualize a página.</h1>");
     }
 });
 
