@@ -4,63 +4,45 @@ const qrcode = require("qrcode");
 const app = express();
 const port = 8080;
 
-// Armazena os QR Codes de cada usuário separadamente
-let qrCodes = {};
+let sessions = {}; // Armazena as conexões ativas
+let qrCodes = {};  // Armazena os QRs por ID
 
-async function connectToWhatsApp(userId = 'default') {
-    // Cria uma pasta de sessão única para cada ID de usuário
-    const { state, saveCreds } = await useMultiFileAuthState('sessions/' + userId);
-    
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true
-    });
+async function startWhatsApp(id) {
+    if (sessions[id]) return; // Já está rodando
+
+    const { state, saveCreds } = await useMultiFileAuthState('sessions/' + id);
+    const sock = makeWASocket({ auth: state, printQRInTerminal: true });
+    sessions[id] = sock;
 
     sock.ev.on('creds.update', saveCreds);
-
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            qrCodes[userId] = await qrcode.toDataURL(qr);
+        if (qr) qrCodes[id] = await qrcode.toDataURL(qr);
+        if (connection === 'open') {
+            qrCodes[id] = "CONECTADO";
+            console.log(`Cliente ${id} conectado!`);
         }
-
         if (connection === 'close') {
+            delete sessions[id];
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) connectToWhatsApp(userId);
-        } else if (connection === 'open') {
-            qrCodes[userId] = "CONECTADO";
-            console.log(`USUÁRIO ${userId} CONECTADO COM SUCESSO!`);
+            if (shouldReconnect) startWhatsApp(id);
         }
     });
 }
 
-// Rota Multiusuário: use /qrcode?id=NOME
 app.get("/qrcode", (req, res) => {
-    const userId = req.query.id || 'default';
-    
-    // Se o usuário nunca tentou conectar, inicia a conexão agora
-    if (!qrCodes[userId]) {
-        connectToWhatsApp(userId);
-        return res.send("<h1>Iniciando sessão para " + userId + "... Aguarde 5 segundos e atualize.</h1>");
-    }
+    const id = req.query.id || 'default';
+    if (!sessions[id]) startWhatsApp(id);
 
-    const status = qrCodes[userId];
-
-    if (status === "CONECTADO") {
-        res.send(`<h1 style='text-align:center;'>✅ ${userId} já está conectado!</h1>`);
-    } else {
-        res.send(`
-            <body style="display:flex;flex-direction:column;align-items:center;background:#075E54;color:white;font-family:sans-serif;">
-                <h1>Escaneie para: ${userId}</h1>
-                <img src="${status}" style="background:white;padding:20px;border-radius:10px;">
-                <p>Atualize a página se o código expirar.</p>
-                <script>setTimeout(() => { location.reload(); }, 25000);</script>
-            </body>
-        `);
-    }
+    setTimeout(() => {
+        const status = qrCodes[id];
+        if (status === "CONECTADO") res.send(`<h1>${id} está ON!</h1>`);
+        else if (status) res.send(`<img src="${status}" width="300"><p>ID: ${id}</p>`);
+        else res.send("<h1>Gerando QR... aguarde e atualize.</h1>");
+    }, 3000);
 });
 
-app.listen(port, () => {
-    console.log(`Servidor multiusuário rodando na porta ${port}`);
+// ESCUTA EM 0.0.0.0 PARA PERMITIR ACESSO EXTERNO
+app.listen(port, '0.0.0.0', () => { 
+    console.log("Servidor Multiusuário ONLINE na porta " + port); 
 });
