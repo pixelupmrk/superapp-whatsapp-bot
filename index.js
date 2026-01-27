@@ -384,3 +384,15 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => console.log(`[Servidor] Servidor multi-usuário rodando na porta ${port}.`));
+// Dentro da função que recebe a resposta da IA
+let respostaLimpa = respostaIA.split('###CRM_START###')[0].trim();
+let jsonExtraido = respostaIA.match(/###CRM_START###([\s\S]*?)###CRM_END###/);
+
+if (jsonExtraido) {
+    const dadosCRM = JSON.parse(jsonExtraido[1]);
+    // Aqui você chama a função que salva no Firebase
+    atualizarCRM(dadosCRM);
+}
+
+// Envia para o WhatsApp apenas a parte amigável
+enviarMensagemWhatsApp(clienteId, respostaLimpa);
