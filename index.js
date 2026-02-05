@@ -1,3 +1,21 @@
+// URL do webhook Supabase
+const WEBHOOK_URL = 'https://qcrnetcdkfwtgphsezoo.supabase.co/functions/v1/bot-webhook';
+
+async function callWebhook(action, userId, data) {
+  try {
+    const response = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, userId, data })
+    });
+    const result = await response.json();
+    console.log(`Webhook ${action}:`, result);
+    return result;
+  } catch (error) {
+    console.error(`Webhook ${action} error:`, error);
+    return null;
+  }
+}
 // index.js CORRIGIDO COM ESTOQUE E GEMINI 2.5 FLASH
 const express = require('express');
 const cors = require('cors');
