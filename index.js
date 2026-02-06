@@ -1,13 +1,4 @@
-// Quando vendedor solicitar avaliação
-await fetch(SUPABASE_WEBHOOK, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    action: 'create_avaliacao',
-    userId: vendedorId,
-    data: { veiculoModelo, veiculoAno, trocaModelo, trocaAno, trocaKm, trocaValorFipe }
-  })
-});
+
 // URL do webhook Supabase
 const WEBHOOK_URL = 'https://qcrnetcdkfwtgphsezoo.supabase.co/functions/v1/bot-webhook';
 
