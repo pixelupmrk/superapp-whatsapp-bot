@@ -1,18 +1,435 @@
-{
-  "name": "superapp-backend-baileys",
-  "version": "2.0.0",
-  "description": "Backend leve para o SuperApp usando Baileys",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "@google/generative-ai": "^0.8.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "firebase-admin": "^12.1.0",
-    "qrcode": "^1.5.3",
-    "@whiskeysockets/baileys": "6.5.0",
-    "pino": "8.14.1"
+/**
+ * =====================================================
+ * PATCH - MEU CARRO ONLINE
+ * =====================================================
+ * 
+ * INSTRUÇÕES DE INSTALAÇÃO:
+ * 1. Copie este código para o FINAL do seu index.js existente
+ *    (antes do app.listen ou Deno.serve)
+ * 2. Não remova nada do código existente!
+ * 3. Adicione as variáveis de ambiente no Render:
+ *    - SUPABASE_WEBHOOK_URL: https://qcrnetcdkfwtgphsezoo.supabase.co/functions/v1/bot-webhook
+ *    - GEMINI_API_KEY: (opcional, para respostas com IA)
+ * 
+ * Este patch adiciona:
+ * ✅ Sincronização de leads com Supabase
+ * ✅ Menu de avaliação de troca
+ * ✅ Baixa de veículo (lojista)
+ * ✅ Mantém 100% do seu bot multi-tenant intacto
+ */
+
+// ========== CONFIGURAÇÕES MEU CARRO ONLINE ==========
+const MEU_CARRO_CONFIG = {
+  SUPABASE_WEBHOOK_URL: process.env.SUPABASE_WEBHOOK_URL || 'https://qcrnetcdkfwtgphsezoo.supabase.co/functions/v1/bot-webhook',
+  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFjcm5ldGNka2Z3dGdwaHNlem9vIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk1NDY0OTgsImV4cCI6MjA4NTEyMjQ5OH0.el2SaXnxVUNSlyrmohMRqaseurQieohKj6d2W3XAAWU',
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+  // Adicione aqui os userIds que devem usar o sistema Meu Carro Online
+  ENABLED_USERS: ['master_autovendas', 'lojista_demo']
+};
+
+// ========== ESTADO DAS CONVERSAS MEU CARRO ==========
+const meuCarroConversations = new Map(); // jid -> { state, data }
+
+// ========== MENUS MEU CARRO ==========
+const MENUS_MEU_CARRO = {
+  principal: `🚗 *Meu Carro Online*
+
+Olá! Como posso ajudar?
+
+1️⃣ Ver carros disponíveis
+2️⃣ Tenho interesse em um carro
+3️⃣ Avaliar meu carro para troca
+4️⃣ Falar com vendedor
+5️⃣ Sou lojista - Reportar venda
+
+Digite o número:`,
+
+  avaliacao_inicio: `📋 *Avaliação de Troca*
+
+Vou precisar de algumas informações:
+
+Qual carro da nossa loja te interessa?
+(Ex: Civic 2020)`,
+
+  avaliacao_seu_carro: `Agora me fale do seu carro:
+- Modelo
+- Ano  
+- Quilometragem
+
+(Ex: Gol 2018 45.000km)`,
+
+  baixa_inicio: `📝 *Baixa de Veículo*
+
+Qual carro foi vendido?
+(Ex: Corolla 2019)`
+};
+
+// ========== HELPER: CHAMAR WEBHOOK SUPABASE ==========
+async function callMeuCarroWebhook(action, userId, data) {
+  try {
+    console.log(`[MEU_CARRO] Webhook ${action} para ${userId}`);
+    
+    const response = await fetch(MEU_CARRO_CONFIG.SUPABASE_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${MEU_CARRO_CONFIG.SUPABASE_ANON_KEY}`,
+        'apikey': MEU_CARRO_CONFIG.SUPABASE_ANON_KEY
+      },
+      body: JSON.stringify({ action, userId, data })
+    });
+
+    const result = await response.json();
+    
+    if (!response.ok) {
+      console.error(`[MEU_CARRO] Webhook erro: ${result.error}`);
+      return { success: false, error: result.error };
+    }
+
+    console.log(`[MEU_CARRO] Webhook ok:`, result);
+    return { success: true, ...result };
+  } catch (error) {
+    console.error(`[MEU_CARRO] Webhook exception:`, error.message);
+    return { success: false, error: error.message };
   }
 }
+
+// ========== PROCESSAR MENSAGEM MEU CARRO ==========
+/**
+ * Chame esta função dentro do seu handler de mensagens existente
+ * Retorna true se a mensagem foi processada, false se deve continuar com o bot normal
+ * 
+ * @param {string} userId - ID do usuário/sessão (ex: 'master_autovendas')
+ * @param {string} jid - JID do contato (ex: '5511999999999@s.whatsapp.net')
+ * @param {string} text - Texto da mensagem recebida
+ * @param {string} pushName - Nome do contato
+ * @param {Function} sendMessage - Função para enviar mensagem (sock.sendMessage)
+ * @returns {Promise<boolean>} - true se processou, false se não
+ */
+async function processMeuCarroMessage(userId, jid, text, pushName, sendMessage) {
+  // Verifica se este userId está habilitado para Meu Carro Online
+  if (!MEU_CARRO_CONFIG.ENABLED_USERS.includes(userId)) {
+    return false; // Não processa, deixa o bot normal continuar
+  }
+
+  const conversation = meuCarroConversations.get(jid) || { state: 'idle', data: {} };
+  const normalizedText = text.trim().toLowerCase();
+
+  console.log(`[MEU_CARRO] ${jid} state=${conversation.state} text="${text.slice(0, 50)}"`);
+
+  // Comandos globais
+  if (['menu', 'início', 'inicio', 'oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite'].includes(normalizedText)) {
+    meuCarroConversations.set(jid, { state: 'menu', data: {} });
+    await sendMessage(jid, { text: MENUS_MEU_CARRO.principal });
+    
+    // Criar/atualizar lead no Supabase
+    await callMeuCarroWebhook('new_lead', userId, {
+      nome: pushName || 'Novo Contato',
+      whatsapp: jid,
+      status: 'novo',
+      botActive: true
+    });
+    
+    return true;
+  }
+
+  if (normalizedText === 'sair' || normalizedText === 'cancelar') {
+    meuCarroConversations.delete(jid);
+    await sendMessage(jid, { text: '👋 Ok! Se precisar, é só chamar.' });
+    return true;
+  }
+
+  // Máquina de estados
+  switch (conversation.state) {
+    case 'menu':
+      return await handleMenuMeuCarro(userId, jid, text, pushName, sendMessage, conversation);
+    
+    case 'avaliacao_carro_interesse':
+      return await handleAvaliacaoCarroInteresse(userId, jid, text, sendMessage, conversation);
+    
+    case 'avaliacao_seu_carro':
+      return await handleAvaliacaoSeuCarro(userId, jid, text, pushName, sendMessage, conversation);
+    
+    case 'baixa_carro':
+      return await handleBaixaCarro(userId, jid, text, sendMessage, conversation);
+    
+    case 'baixa_comprador':
+      return await handleBaixaComprador(userId, jid, text, sendMessage, conversation);
+    
+    case 'baixa_cpf':
+      return await handleBaixaCpf(userId, jid, text, sendMessage, conversation);
+    
+    case 'baixa_troca':
+      return await handleBaixaTroca(userId, jid, text, sendMessage, conversation);
+    
+    case 'baixa_canal':
+      return await handleBaixaCanal(userId, jid, text, sendMessage, conversation);
+    
+    default:
+      // Estado idle ou desconhecido - mostra menu
+      meuCarroConversations.set(jid, { state: 'menu', data: {} });
+      await sendMessage(jid, { text: MENUS_MEU_CARRO.principal });
+      return true;
+  }
+}
+
+// ========== HANDLERS DE ESTADO ==========
+
+async function handleMenuMeuCarro(userId, jid, text, pushName, sendMessage, conversation) {
+  const option = text.trim();
+
+  switch (option) {
+    case '1':
+      // Ver carros disponíveis
+      const veiculos = await callMeuCarroWebhook('list_veiculos', userId, {});
+      if (veiculos.success && veiculos.veiculos?.length > 0) {
+        let lista = '🚗 *Carros Disponíveis:*\n\n';
+        veiculos.veiculos.slice(0, 5).forEach((v, i) => {
+          lista += `${i + 1}. ${v.modelo} ${v.ano} - R$ ${v.preco?.toLocaleString() || 'Consulte'}\n`;
+        });
+        lista += '\n_Digite o número do carro para mais info ou "menu" para voltar_';
+        await sendMessage(jid, { text: lista });
+      } else {
+        await sendMessage(jid, { text: '📋 Estamos atualizando nosso estoque. Entre em contato com um vendedor!' });
+      }
+      return true;
+
+    case '2':
+      // Interesse em um carro
+      await sendMessage(jid, { text: '🚗 Qual carro te interessa? (Ex: Civic 2020)' });
+      conversation.state = 'interesse_carro';
+      meuCarroConversations.set(jid, conversation);
+      return true;
+
+    case '3':
+      // Avaliação de troca
+      await sendMessage(jid, { text: MENUS_MEU_CARRO.avaliacao_inicio });
+      conversation.state = 'avaliacao_carro_interesse';
+      conversation.data = { clienteNome: pushName };
+      meuCarroConversations.set(jid, conversation);
+      return true;
+
+    case '4':
+      // Falar com vendedor
+      await sendMessage(jid, { text: '👤 Transferindo para um vendedor... Aguarde!' });
+      await callMeuCarroWebhook('update_lead', userId, {
+        whatsapp: jid,
+        status: 'aguardando_vendedor',
+        botActive: false
+      });
+      meuCarroConversations.delete(jid);
+      return true;
+
+    case '5':
+      // Baixa de veículo (lojista)
+      await sendMessage(jid, { text: MENUS_MEU_CARRO.baixa_inicio });
+      conversation.state = 'baixa_carro';
+      conversation.data = {};
+      meuCarroConversations.set(jid, conversation);
+      return true;
+
+    default:
+      await sendMessage(jid, { text: '❓ Opção inválida. Digite um número de 1 a 5.' });
+      return true;
+  }
+}
+
+async function handleAvaliacaoCarroInteresse(userId, jid, text, sendMessage, conversation) {
+  // Extrair modelo e ano do carro de interesse
+  const match = text.match(/([a-zA-Z\s]+)\s*(\d{4})?/i);
+  const modelo = match?.[1]?.trim() || text.trim();
+  const ano = match?.[2] || '';
+
+  conversation.data.veiculoInteresseModelo = modelo;
+  conversation.data.veiculoInteresseAno = ano;
+  conversation.state = 'avaliacao_seu_carro';
+  meuCarroConversations.set(jid, conversation);
+
+  await sendMessage(jid, { text: MENUS_MEU_CARRO.avaliacao_seu_carro });
+  return true;
+}
+
+async function handleAvaliacaoSeuCarro(userId, jid, text, pushName, sendMessage, conversation) {
+  // Extrair dados do carro de troca
+  const match = text.match(/([a-zA-Z\s]+)\s*(\d{4})?\s*(\d+\.?\d*)?/i);
+  const modelo = match?.[1]?.trim() || text.trim();
+  const ano = match?.[2] || '';
+  const km = match?.[3] || '';
+
+  // Criar avaliação no Supabase
+  const result = await callMeuCarroWebhook('create_avaliacao', userId, {
+    vendedorWhatsapp: jid.split('@')[0],
+    vendedorNome: pushName || 'Cliente',
+    clienteNome: conversation.data.clienteNome,
+    clienteWhatsapp: jid.split('@')[0],
+    veiculoModelo: conversation.data.veiculoInteresseModelo,
+    veiculoAno: conversation.data.veiculoInteresseAno,
+    trocaModelo: modelo,
+    trocaAno: ano,
+    trocaKm: km + ' km',
+    trocaValorFipe: 'A consultar'
+  });
+
+  if (result.success) {
+    await sendMessage(jid, { 
+      text: `✅ *Solicitação de avaliação enviada!*
+
+📋 Resumo:
+- Você quer: ${conversation.data.veiculoInteresseModelo} ${conversation.data.veiculoInteresseAno}
+- Seu carro: ${modelo} ${ano} ${km}km
+
+Nossa equipe vai analisar e entrar em contato em breve!
+
+_Digite "menu" para voltar ao início_`
+    });
+  } else {
+    await sendMessage(jid, { 
+      text: `⚠️ Não encontramos o carro "${conversation.data.veiculoInteresseModelo}" em nossa vitrine. 
+
+Quer falar com um vendedor? Digite 4`
+    });
+  }
+
+  meuCarroConversations.delete(jid);
+  return true;
+}
+
+async function handleBaixaCarro(userId, jid, text, sendMessage, conversation) {
+  conversation.data.veiculoModelo = text.trim();
+  conversation.state = 'baixa_comprador';
+  meuCarroConversations.set(jid, conversation);
+
+  await sendMessage(jid, { text: '👤 Qual o nome do comprador?' });
+  return true;
+}
+
+async function handleBaixaComprador(userId, jid, text, sendMessage, conversation) {
+  conversation.data.compradorNome = text.trim();
+  conversation.state = 'baixa_cpf';
+  meuCarroConversations.set(jid, conversation);
+
+  await sendMessage(jid, { text: '🆔 CPF do comprador:' });
+  return true;
+}
+
+async function handleBaixaCpf(userId, jid, text, sendMessage, conversation) {
+  conversation.data.compradorCpf = text.replace(/\D/g, '');
+  conversation.state = 'baixa_troca';
+  meuCarroConversations.set(jid, conversation);
+
+  await sendMessage(jid, { text: '🔄 Teve carro na troca? (Sim/Não)' });
+  return true;
+}
+
+async function handleBaixaTroca(userId, jid, text, sendMessage, conversation) {
+  const teve = text.toLowerCase().includes('sim') ? true : false;
+  conversation.data.tevetroca = teve;
+  conversation.state = 'baixa_canal';
+  meuCarroConversations.set(jid, conversation);
+
+  await sendMessage(jid, { text: '📱 Canal de venda:\n1️⃣ Meu Carro Online\n2️⃣ Outros' });
+  return true;
+}
+
+async function handleBaixaCanal(userId, jid, text, sendMessage, conversation) {
+  const canal = text.includes('1') ? 'Meu Carro Online' : 'Outros';
+  conversation.data.canalVenda = canal;
+
+  // Enviar baixa para o webhook
+  const result = await callMeuCarroWebhook('veiculo_vendido', userId, {
+    lojaId: userId,
+    veiculo: {
+      modelo: conversation.data.veiculoModelo,
+      ano: '',
+      preco: ''
+    },
+    comprador: {
+      nome: conversation.data.compradorNome,
+      cpf: conversation.data.compradorCpf
+    },
+    tevetroca: conversation.data.tevetroca,
+    canalVenda: canal
+  });
+
+  await sendMessage(jid, { 
+    text: `✅ *Venda registrada com sucesso!*
+
+📋 Resumo:
+- Veículo: ${conversation.data.veiculoModelo}
+- Comprador: ${conversation.data.compradorNome}
+- CPF: ${conversation.data.compradorCpf}
+- Troca: ${conversation.data.tevetroca ? 'Sim' : 'Não'}
+- Canal: ${canal}
+
+Central notificada! 🎉`
+  });
+
+  meuCarroConversations.delete(jid);
+  return true;
+}
+
+// ========== SALVAR MENSAGEM NO SUPABASE ==========
+async function saveMeuCarroMessage(userId, jid, text, isFromMe, contactName) {
+  if (!MEU_CARRO_CONFIG.ENABLED_USERS.includes(userId)) return;
+  
+  await callMeuCarroWebhook('save_message', userId, {
+    whatsapp: jid,
+    text: text,
+    isFromMe: isFromMe,
+    contactName: contactName
+  });
+}
+
+// ========== EXPORT ==========
+// Se estiver usando CommonJS (Node.js normal):
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    processMeuCarroMessage,
+    saveMeuCarroMessage,
+    MEU_CARRO_CONFIG,
+    meuCarroConversations
+  };
+}
+
+// Se estiver usando ES Modules:
+// export { processMeuCarroMessage, saveMeuCarroMessage, MEU_CARRO_CONFIG, meuCarroConversations };
+
+/**
+ * =====================================================
+ * EXEMPLO DE INTEGRAÇÃO NO SEU index.js
+ * =====================================================
+ * 
+ * No seu handler de mensagens recebidas, adicione:
+ * 
+ * ```javascript
+ * // Dentro do evento 'messages.upsert':
+ * sock.ev.on('messages.upsert', async ({ messages }) => {
+ *   for (const msg of messages) {
+ *     const jid = msg.key.remoteJid;
+ *     const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+ *     const pushName = msg.pushName || '';
+ *     const isFromMe = msg.key.fromMe;
+ * 
+ *     if (isFromMe || !text) continue;
+ * 
+ *     // ===== PATCH MEU CARRO ONLINE =====
+ *     const userId = 'master_autovendas'; // ou a sessão atual
+ *     
+ *     // Salva a mensagem
+ *     await saveMeuCarroMessage(userId, jid, text, false, pushName);
+ *     
+ *     // Processa com o bot Meu Carro Online
+ *     const processed = await processMeuCarroMessage(userId, jid, text, pushName, 
+ *       (to, content) => sock.sendMessage(to, content)
+ *     );
+ *     
+ *     if (processed) {
+ *       continue; // Mensagem processada pelo Meu Carro, não continua com bot normal
+ *     }
+ *     // ===== FIM PATCH =====
+ * 
+ *     // Seu código normal do bot continua aqui...
+ *   }
+ * });
+ * ```
+ */
